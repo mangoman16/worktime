@@ -1972,16 +1972,16 @@ show_welcome() {
 # ============================================================
 help_hint() {
     echo -e "  ${BOLD}drill in${NC}"
-    echo -e "    ${WHITE}help <category>${NC}   ${GREEN}logging${NC}${DIM} ·${NC} ${CYAN}view${NC}${DIM} ·${NC} ${YELLOW}editing${NC}${DIM} ·${NC} ${MAGENTA}scoping${NC}${DIM} ·${NC} ${BLUE}tools${NC}"
+    echo -e "    ${WHITE}help <category>${NC}   ${GREEN}logging${NC}${DIM},${NC} ${CYAN}view${NC}${DIM},${NC} ${YELLOW}editing${NC}${DIM},${NC} ${MAGENTA}scoping${NC}${DIM},${NC} ${BLUE}tools${NC}"
     echo -e "    ${WHITE}help <command>${NC}    ${DIM}any command listed above   (e.g.${NC} ${WHITE}help edit${NC}${DIM})${NC}"
-    echo -e "    ${WHITE}help <topic>${NC}      ${WHITE}types${NC}${DIM} ·${NC} ${WHITE}billing${NC}${DIM} ·${NC} ${WHITE}breaks${NC}${DIM} ·${NC} ${WHITE}flags${NC}"
+    echo -e "    ${WHITE}help <topic>${NC}      ${WHITE}types${NC}${DIM},${NC} ${WHITE}billing${NC}${DIM},${NC} ${WHITE}breaks${NC}${DIM},${NC} ${WHITE}flags${NC}"
     echo -e "    ${WHITE}help full${NC}         ${DIM}everything on one screen${NC}"
 }
 
-# Render one category row: colored label + dot-separated command names.
+# Render one category row: colored label + comma-separated command names.
 print_help_row() {
     local label="$1" color="$2"; shift 2
-    local sep="${DIM} · ${NC}"
+    local sep="${DIM},${NC} "
     local line="" cmd first=1
     for cmd in "$@"; do
         if [ $first -eq 1 ]; then
