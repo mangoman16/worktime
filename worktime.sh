@@ -1,0 +1,2240 @@
+#!/bin/bash
+# ============================================================
+#  Task Timer v25
+#  Changes from v24:
+#   * Welcome shows Linux-style date (e.g. "Tue May  5 11:18:42 AM CEST 2026")
+#   * RECORD_BREAKS split into BREAKS_ENABLED (master switch) +
+#     LOG_BREAKS (whether full breaks become log entries).
+#   * Type detection uses unique-prefix matching:
+#       m / mo / mon / monit / monitoring  -> monitoring
+#       ta / tas / task                    -> task
+#       ti / tic / tick / ticket           -> ticket
+#       t                                  -> ambiguous, prompts
+#     Unambiguous matches skip the type menu entirely.
+#   * `edit` (no args) re-prompts the LAST field of the last
+#     task touched; `edit <id>` runs the full walkthrough.
+#   * `bill` prompt is bare (no "(h, blank=0)" hint).
+#   * CLI flags:
+#       -d <dir>  / --directory <dir>   recursively scope a dir
+#       -l <file> / --log <file>        scope a single CSV
+#     Profile path is unchanged.
+#   * Listings, search, and stats render as aligned columns
+#     with dim headers and a thin total separator.
+# ============================================================
+
+set -u
+
+VERSION="25"
+
+# ---------- Paths ----------
+LOG_DIR="$HOME/.task_timer"
+EXPORT_DIR="$HOME/.task_export"
+PROFILE_FILE="$LOG_DIR/profile"
+LEGACY_SMTP="$HOME/.timelog_smtp_config"
+
+BREAK_INTERVAL=3000        # 50 min idle threshold
+BREAK_LENGTH=600           # 10 min break length
+BREAK_CHECK_INTERVAL=60
+
+mkdir -p "$LOG_DIR" "$EXPORT_DIR"
+
+INDEX_FILE="$(mktemp -t task_timer_index.XXXXXX)"
+TEMP_FILE="$(mktemp -t task_timer_current.XXXXXX)"
+TS_FILE="$(mktemp -t task_timer_ts.XXXXXX)"
+ALERT_FILE="${TS_FILE}.alert"
+WATCHER_PID=""
+
+cleanup() {
+    [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null
+    rm -f "$INDEX_FILE" "$TEMP_FILE" "$TS_FILE" "$ALERT_FILE"
+}
+trap cleanup EXIT
+
+# ---------- Colors ----------
+RED='\033[0;31m'
+GREEN='\033[1;32m'
+BLUE='\033[1;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+MAGENTA='\033[1;35m'
+WHITE='\033[1;37m'
+GRAY='\033[0;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Type column width: enough for "[appointment]" (13 chars)
+TYPE_COL_WIDTH=13
+
+# Listing column widths
+COL_ID=4
+COL_TIME=13
+COL_TYPE=14
+COL_TITLE=34
+COL_DUR=10
+COL_BILL=18
+
+# ---------- Known task types ----------
+TASK_TYPES=("task" "ticket" "project" "order" "appointment" "monitoring" "break")
+
+# Default 2-letter shortcut shown in menus
+declare -A DEFAULT_SHORTCUT=(
+    ["task"]="ta"
+    ["ticket"]="ti"
+    ["project"]="pr"
+    ["order"]="or"
+    ["appointment"]="ap"
+    ["monitoring"]="mo"
+    ["break"]="br"
+)
+
+is_known_type() {
+    local t="$1" k
+    for k in "${TASK_TYPES[@]}"; do
+        [ "$t" = "$k" ] && return 0
+    done
+    return 1
+}
+
+# Match a string against TASK_TYPES as a case-insensitive prefix.
+# Echoes:
+#   <type>             - if exactly one type starts with the string
+#   "AMBIG:t1,t2,..."  - if multiple types match
+#   ""                 - if zero types match
+match_type_prefix() {
+    local pfx="${1,,}"
+    [ -z "$pfx" ] && { echo ""; return 1; }
+    local matches=() t
+    for t in "${TASK_TYPES[@]}"; do
+        if [[ "$t" == "$pfx"* ]]; then
+            matches+=("$t")
+        fi
+    done
+    case "${#matches[@]}" in
+        0) echo "";  return 1 ;;
+        1) echo "${matches[0]}"; return 0 ;;
+        *)
+            local joined; joined=$(IFS=,; echo "${matches[*]}")
+            echo "AMBIG:$joined"
+            return 2
+            ;;
+    esac
+}
+
+# ============================================================
+#  Profile
+# ============================================================
+NAME=""
+HOURLY_RATE=0
+BREAKS_ENABLED="yes"
+LOG_BREAKS="no"
+SMTP_SERVER=""; SMTP_PORT=""; SMTP_USER=""; SMTP_PASS=""
+SMTP_FROM="";   SMTP_TO="";   SMTP_TLS=""
+
+write_profile() {
+    local name="$1" rate="$2" breaks_en="$3" log_br="$4"
+    local s_serv="$5" s_port="$6" s_user="$7" s_pass="$8"
+    local s_from="$9" s_to="${10}" s_tls="${11}"
+    local prev_umask; prev_umask=$(umask)
+    umask 077
+    cat > "$PROFILE_FILE" <<EOF
+# Task Timer profile
+# Edit values below. Sourced as bash on every start.
+# Use 'profile' inside the timer to view, 'profile edit' to walk
+# through values, or 'profile open' to launch \$EDITOR.
+
+# Greeting name
+NAME="$name"
+
+# EUR per hour (used to compute billable EUR from billable hours)
+HOURLY_RATE=$rate
+
+# Master break switch. yes/no.
+#   yes -> after $((BREAK_INTERVAL/60)) min idle, prompt for a break
+#   no  -> never prompt; no idle watcher
+BREAKS_ENABLED="$breaks_en"
+
+# When a full break is taken, write a 'break' entry to the log? yes/no.
+# Has no effect when BREAKS_ENABLED=no.
+LOG_BREAKS="$log_br"
+
+# SMTP for ICS email export (leave blank to disable)
+SMTP_SERVER="$s_serv"
+SMTP_PORT=$s_port
+SMTP_USER="$s_user"
+SMTP_PASS="$s_pass"
+SMTP_FROM="$s_from"
+SMTP_TO="$s_to"
+SMTP_TLS="$s_tls"
+EOF
+    chmod 600 "$PROFILE_FILE"
+    umask "$prev_umask"
+}
+
+# Re-emit the profile from the current in-memory state
+# (used by load_profile when migrating an old RECORD_BREAKS field).
+rewrite_profile_from_memory() {
+    write_profile \
+        "${NAME:-}" "${HOURLY_RATE:-0}" \
+        "${BREAKS_ENABLED:-yes}" "${LOG_BREAKS:-no}" \
+        "${SMTP_SERVER:-}" "${SMTP_PORT:-465}" "${SMTP_USER:-}" "${SMTP_PASS:-}" \
+        "${SMTP_FROM:-}" "${SMTP_TO:-}" "${SMTP_TLS:-yes}"
+}
+
+prompt_yesno() {
+    local label="$1" def="$2" hint resp
+    if [ "$def" = "y" ]; then hint="[Y/n]"; else hint="[y/N]"; fi
+    while :; do
+        read -r -p "$(echo -ne "${DIM}${label}${NC} ${WHITE}${hint}${NC} ${BOLD}>${NC} ")" resp
+        if [ -z "$resp" ]; then resp="$def"; fi
+        case "${resp,,}" in
+            y|yes) echo "y"; return ;;
+            n|no)  echo "n"; return ;;
+            *) echo -e "  ${RED}please answer y or n${NC}" ;;
+        esac
+    done
+}
+
+interactive_profile_setup() {
+    local name="${NAME:-you}"
+    local rate="${HOURLY_RATE:-120.00}"
+    local breaks_en="${BREAKS_ENABLED:-yes}"
+    local log_br="${LOG_BREAKS:-no}"
+    local s_serv="${SMTP_SERVER:-}"
+    local s_port="${SMTP_PORT:-465}"
+    local s_user="${SMTP_USER:-}"
+    local s_pass="${SMTP_PASS:-}"
+    local s_from="${SMTP_FROM:-}"
+    local s_to="${SMTP_TO:-}"
+    local s_tls="${SMTP_TLS:-yes}"
+
+    echo
+    echo -e "${BOLD}profile setup${NC}  ${DIM}${PROFILE_FILE/#$HOME/~}${NC}"
+    echo -e "${DIM}press enter to keep the value in [brackets]${NC}"
+    echo
+
+    local in
+    read -r -p "$(echo -ne "${DIM}name${NC}              ${WHITE}[${name}]${NC} ${BOLD}>${NC} ")" in
+    name="${in:-$name}"
+
+    while :; do
+        read -r -p "$(echo -ne "${DIM}hourly rate (EUR)${NC} ${WHITE}[${rate}]${NC} ${BOLD}>${NC} ")" in
+        in="${in:-$rate}"
+        in="${in//,/.}"
+        if [[ "$in" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            rate=$(printf "%.2f" "$in"); break
+        fi
+        echo -e "  ${RED}invalid rate, must be a number${NC}"
+    done
+
+    # Two-step break configuration:
+    #  1. master switch
+    #  2. (only if on) whether to log break entries
+    local def_be="y"; [ "$breaks_en" = "no" ] && def_be="n"
+    echo
+    echo -e "${DIM}breaks: prompt me for a $((BREAK_LENGTH/60)) min break after $((BREAK_INTERVAL/60)) min idle?${NC}"
+    local resp_be; resp_be=$(prompt_yesno "enable break reminders?" "$def_be")
+    if [ "$resp_be" = "y" ]; then
+        breaks_en="yes"
+        local def_lb="n"; [ "$log_br" = "yes" ] && def_lb="y"
+        echo -e "${DIM}log a 'break' entry in the day log when a full break is taken?${NC}"
+        local resp_lb; resp_lb=$(prompt_yesno "log breaks as entries?" "$def_lb")
+        [ "$resp_lb" = "y" ] && log_br="yes" || log_br="no"
+    else
+        breaks_en="no"
+        # log_br stays whatever it was; doesn't apply when breaks are off.
+    fi
+
+    echo
+    local default_smtp="n"; [ -n "$s_serv" ] && default_smtp="y"
+    local want_smtp; want_smtp=$(prompt_yesno "configure SMTP for ICS email export?" "$default_smtp")
+
+    if [ "$want_smtp" = "y" ]; then
+        read -r -p "$(echo -ne "${DIM}smtp server${NC}       ${WHITE}[${s_serv}]${NC} ${BOLD}>${NC} ")" in; s_serv="${in:-$s_serv}"
+        read -r -p "$(echo -ne "${DIM}smtp port${NC}         ${WHITE}[${s_port}]${NC} ${BOLD}>${NC} ")" in; s_port="${in:-$s_port}"
+        read -r -p "$(echo -ne "${DIM}smtp user${NC}         ${WHITE}[${s_user}]${NC} ${BOLD}>${NC} ")" in; s_user="${in:-$s_user}"
+        local pass_hint="(blank = keep)"
+        [ -z "$s_pass" ] && pass_hint="(input hidden)"
+        read -r -s -p "$(echo -ne "${DIM}smtp pass${NC}         ${WHITE}${pass_hint}${NC} ${BOLD}>${NC} ")" in; echo
+        [ -n "$in" ] && s_pass="$in"
+        read -r -p "$(echo -ne "${DIM}smtp from${NC}         ${WHITE}[${s_from}]${NC} ${BOLD}>${NC} ")" in; s_from="${in:-$s_from}"
+        read -r -p "$(echo -ne "${DIM}smtp to${NC}           ${WHITE}[${s_to}]${NC} ${BOLD}>${NC} ")" in; s_to="${in:-$s_to}"
+        read -r -p "$(echo -ne "${DIM}smtp tls (yes/no)${NC} ${WHITE}[${s_tls}]${NC} ${BOLD}>${NC} ")" in; s_tls="${in:-$s_tls}"
+    fi
+
+    write_profile "$name" "$rate" "$breaks_en" "$log_br" \
+        "$s_serv" "$s_port" "$s_user" "$s_pass" "$s_from" "$s_to" "$s_tls"
+    echo
+    echo -e "${GREEN}─ profile${NC}   saved to ${WHITE}${PROFILE_FILE/#$HOME/~}${NC}"
+}
+
+load_profile() {
+    [ -f "$PROFILE_FILE" ] && source "$PROFILE_FILE"
+    [ -f "$LEGACY_SMTP" ] && source "$LEGACY_SMTP"
+    : "${HOURLY_RATE:=0}"
+    : "${NAME:=}"
+
+    # Migrate legacy RECORD_BREAKS -> BREAKS_ENABLED + LOG_BREAKS.
+    if [ -n "${RECORD_BREAKS:-}" ] && [ -z "${BREAKS_ENABLED:-}" ]; then
+        BREAKS_ENABLED="yes"
+        if [[ "${RECORD_BREAKS,,}" =~ ^(yes|true|y|1|on)$ ]]; then
+            LOG_BREAKS="yes"
+        else
+            LOG_BREAKS="no"
+        fi
+        unset RECORD_BREAKS
+        rewrite_profile_from_memory 2>/dev/null || true
+    fi
+
+    : "${BREAKS_ENABLED:=yes}"
+    : "${LOG_BREAKS:=no}"
+}
+
+# ============================================================
+#  Path helpers
+# ============================================================
+get_log_path() {
+    local d="$1"
+    local y="${d%%-*}"
+    local rest="${d#*-}"
+    local m="${rest%%-*}"
+    echo "$LOG_DIR/$y/$m/$d-tasks.csv"
+}
+
+ensure_log_path() {
+    local d="$1" p
+    p="$(get_log_path "$d")"
+    mkdir -p "$(dirname "$p")"
+    echo "$p"
+}
+
+today_date() { date +%Y-%m-%d; }
+
+# ============================================================
+#  Break reminder watcher
+# ============================================================
+touch_timestamp() {
+    date +%s > "$TS_FILE"
+}
+
+start_break_watcher() {
+    [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 0
+    (
+        while [ -f "$TS_FILE" ]; do
+            sleep "$BREAK_CHECK_INTERVAL"
+            [ -f "$TS_FILE" ] || exit 0
+            local last now delta
+            last=$(cat "$TS_FILE" 2>/dev/null) || continue
+            [[ "$last" =~ ^[0-9]+$ ]] || continue
+            now=$(date +%s)
+            delta=$((now - last))
+            if [ $delta -ge $BREAK_INTERVAL ]; then
+                if command -v notify-send >/dev/null 2>&1; then
+                    notify-send -u normal "Take a break" \
+                        "$((BREAK_INTERVAL/60)) min since last task — step away from the monitor for a bit." \
+                        2>/dev/null || true
+                fi
+                date +%s > "$ALERT_FILE"
+                date +%s > "$TS_FILE"
+            fi
+        done
+    ) &
+    WATCHER_PID=$!
+    disown "$WATCHER_PID" 2>/dev/null || true
+}
+
+# ============================================================
+#  Scope and active date
+# ============================================================
+ACTIVE_DATE=""
+SCOPE_FILES=()
+SCOPE_LABEL=""
+
+scope_set_today() {
+    ACTIVE_DATE="$(today_date)"
+    SCOPE_FILES=("$(get_log_path "$ACTIVE_DATE")")
+    SCOPE_LABEL="today ($ACTIVE_DATE)"
+}
+
+scope_set_date() {
+    local d="$1"
+    if ! [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo -e "${RED}date must be YYYY-MM-DD${NC}"; return 1
+    fi
+    if ! date -d "$d" +%s >/dev/null 2>&1; then
+        echo -e "${RED}invalid calendar date: $d${NC}"; return 1
+    fi
+    ACTIVE_DATE="$d"
+    SCOPE_FILES=("$(get_log_path "$d")")
+    if [ "$d" = "$(today_date)" ]; then
+        SCOPE_LABEL="today ($d)"
+    elif [ "$d" = "$(date -d '1 day ago' +%Y-%m-%d)" ]; then
+        SCOPE_LABEL="yesterday ($d)"
+    elif [ "$d" = "$(date -d 'tomorrow' +%Y-%m-%d)" ]; then
+        SCOPE_LABEL="tomorrow ($d)"
+    else
+        SCOPE_LABEL="$d"
+    fi
+}
+
+shift_active_date() {
+    local offset="$1"
+    local current="${ACTIVE_DATE:-$(today_date)}"
+    local new_date
+    if ! new_date=$(date -d "$current $offset day" +%Y-%m-%d 2>/dev/null); then
+        echo -e "${RED}date computation failed${NC}"; return 1
+    fi
+    scope_set_date "$new_date"
+}
+
+scope_set_range() {
+    local start="$1" end="$2"
+    if ! date -d "$start" +%s >/dev/null 2>&1 || ! date -d "$end" +%s >/dev/null 2>&1; then
+        echo -e "${RED}invalid date range${NC}"; return 1
+    fi
+    if [[ "$end" < "$start" ]]; then
+        echo -e "${RED}end date must be on or after start date${NC}"; return 1
+    fi
+    SCOPE_FILES=()
+    ACTIVE_DATE=""
+    local cur="$start"
+    while :; do
+        local p; p=$(get_log_path "$cur")
+        [ -f "$p" ] && SCOPE_FILES+=("$p")
+        [ "$cur" = "$end" ] && break
+        cur=$(date -d "$cur + 1 day" +%Y-%m-%d)
+    done
+    SCOPE_LABEL="$start -> $end"
+}
+
+scope_set_month() {
+    local arg="${1:-$(date +%Y-%m)}"
+    if ! [[ "$arg" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+        echo -e "${RED}month format: YYYY-MM${NC}"; return 1
+    fi
+    local y="${arg%-*}" m="${arg#*-}"
+    local dir="$LOG_DIR/$y/$m"
+    SCOPE_FILES=()
+    ACTIVE_DATE=""
+    if [ -d "$dir" ]; then
+        while IFS= read -r f; do
+            [ -f "$f" ] && SCOPE_FILES+=("$f")
+        done < <(find "$dir" -maxdepth 1 -type f -name '*-tasks.csv' | sort)
+    fi
+    SCOPE_LABEL="$y-$m"
+}
+
+scope_set_year() {
+    local y="${1:-$(date +%Y)}"
+    if ! [[ "$y" =~ ^[0-9]{4}$ ]]; then
+        echo -e "${RED}year format: YYYY${NC}"; return 1
+    fi
+    local dir="$LOG_DIR/$y"
+    SCOPE_FILES=()
+    ACTIVE_DATE=""
+    if [ -d "$dir" ]; then
+        while IFS= read -r f; do
+            [ -f "$f" ] && SCOPE_FILES+=("$f")
+        done < <(find "$dir" -type f -name '*-tasks.csv' | sort)
+    fi
+    SCOPE_LABEL="year $y"
+}
+
+# Used by the -d / --directory CLI flag.
+scope_set_directory() {
+    local dir="$1"
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}directory not found: $dir${NC}"; return 1
+    fi
+    SCOPE_FILES=()
+    ACTIVE_DATE=""
+    while IFS= read -r f; do
+        [ -f "$f" ] && SCOPE_FILES+=("$f")
+    done < <(find "$dir" -type f -name '*-tasks.csv' | sort)
+    local short="${dir/#$HOME/~}"
+    SCOPE_LABEL="dir $short"
+}
+
+# Used by the -l / --log CLI flag.
+scope_set_logfile() {
+    local f="$1"
+    if [ ! -f "$f" ]; then
+        echo -e "${RED}log file not found: $f${NC}"; return 1
+    fi
+    SCOPE_FILES=("$f")
+    ACTIVE_DATE=""
+    local short; short=$(basename "$f")
+    SCOPE_LABEL="log $short"
+}
+
+# ============================================================
+#  Index
+#  Each line: gid|file|line_in_file|date|range|title|dur|desc|type|hours
+# ============================================================
+build_index() {
+    : > "$INDEX_FILE"
+    local gid=0 f
+    for f in "${SCOPE_FILES[@]}"; do
+        [ -f "$f" ] || continue
+        local n=0
+        while IFS= read -r line || [ -n "$line" ]; do
+            n=$((n+1))
+            gid=$((gid+1))
+            printf '%s|%s|%s|%s\n' "$gid" "$f" "$n" "$line" >> "$INDEX_FILE"
+        done < "$f"
+    done
+}
+
+index_lookup() {
+    awk -F'|' -v id="$1" '$1==id {print; exit}' "$INDEX_FILE"
+}
+
+index_count() {
+    [ -s "$INDEX_FILE" ] || { echo 0; return; }
+    wc -l < "$INDEX_FILE"
+}
+
+parse_index_line() {
+    IFS='|' read -r I_GID I_FILE I_LINE I_DATE I_RANGE I_TITLE I_DUR I_DESC I_TYPE I_HOURS <<< "$1"
+}
+
+# ============================================================
+#  Time helpers
+# ============================================================
+pad_time() { printf "%02d" $((10#$1)); }
+
+read_time() {
+    local prompt="$1" default="$2" t
+    while true; do
+        read -r -p "$(echo -ne "${DIM}${prompt}${NC} ${WHITE}[${default}]${NC} > ")" t
+        t=${t:-$default}
+        if [[ "$t" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+            local h="${t%%:*}" m="${t##*:}"
+            printf "%s:%s" "$(pad_time "$h")" "$(pad_time "$m")"
+            return
+        fi
+        echo -e "${RED}invalid time, use HH:MM (00:00-23:59)${NC}"
+    done
+}
+
+adjust_time() {
+    local t="$1" off="$2"
+    local h="${t%%:*}" m="${t##*:}"
+    local total=$((10#$h * 60 + 10#$m + off))
+    while [ $total -lt 0 ]; do total=$((total + 1440)); done
+    while [ $total -ge 1440 ]; do total=$((total - 1440)); done
+    printf "%02d:%02d" $((total / 60)) $((total % 60))
+}
+
+calculate_duration() {
+    local s="$1" e="$2"
+    local sh="${s%%:*}" sm="${s##*:}" eh="${e%%:*}" em="${e##*:}"
+    local sm_t=$((10#$sh * 60 + 10#$sm))
+    local em_t=$((10#$eh * 60 + 10#$em))
+    [ $em_t -lt $sm_t ] && em_t=$((em_t + 1440))
+    [ $em_t -eq $sm_t ] && em_t=$((em_t + 1))
+    local dur=$((em_t - sm_t))
+    local h=$((dur / 60)) m=$((dur % 60))
+    if [ $h -gt 0 ]; then echo "${h}h ${m}m"; else echo "${m}m"; fi
+}
+
+duration_to_minutes() {
+    local d="$1" total=0 hours mins
+    if [[ "$d" == *"h"* ]]; then
+        hours=$(echo "$d" | grep -oE '[0-9]+h' | sed 's/h//')
+        [ -n "$hours" ] && total=$((total + hours * 60))
+    fi
+    mins=$(echo "$d" | grep -oE '[0-9]+m' | sed 's/m//')
+    [ -n "$mins" ] && total=$((total + mins))
+    echo "$total"
+}
+
+format_minutes() {
+    local m="$1"
+    local h=$((m / 60)) r=$((m % 60))
+    if [ $h -gt 0 ]; then echo "${h}h ${r}m"; else echo "${r}m"; fi
+}
+
+# ============================================================
+#  Sanitization & billable-hours helpers
+# ============================================================
+escape_sed() {
+    printf '%s\n' "$1" | sed -e 's/[\\/&|]/\\&/g'
+}
+
+sanitize_pipe() {
+    local s="$1"
+    if [[ "$s" == *"|"* ]]; then
+        echo -e "${RED}'|' is not allowed in this field; replaced with '-'.${NC}" >&2
+        echo "${s//|/-}"
+    else
+        echo "$s"
+    fi
+}
+
+validate_hours() {
+    local h="$1"
+    [ -z "$h" ] && { echo "0.00"; return 0; }
+    h="${h//,/.}"
+    h="${h//[[:space:]]/}"
+    h="${h//h/}"
+    if [[ "$h" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        printf "%.2f\n" "$h"
+        return 0
+    fi
+    return 1
+}
+
+format_hours() {
+    local h="$1"
+    [ -z "$h" ] && return
+    [ "$(awk -v h="$h" 'BEGIN{print (h+0 == 0)}')" = "1" ] && return
+    local m; m=$(awk -v h="$h" 'BEGIN{printf "%d", h*60+0.5}')
+    local hh=$((m / 60)) mm=$((m % 60))
+    if   [ $hh -gt 0 ] && [ $mm -gt 0 ]; then echo "${hh}h ${mm}m"
+    elif [ $hh -gt 0 ];                  then echo "${hh}h"
+    else                                      echo "${mm}m"
+    fi
+}
+
+hours_is_billed() {
+    local h="$1"
+    [ -z "$h" ] && return 1
+    [ "$(awk -v h="$h" 'BEGIN{print (h+0 > 0)}')" = "1" ]
+}
+
+format_eur_for_hours() {
+    local h="$1"
+    [ -z "$h" ] && return
+    local eur; eur=$(awk -v h="$h" -v r="$HOURLY_RATE" 'BEGIN{printf "%.2f", h*r}')
+    [ "$(awk -v e="$eur" 'BEGIN{print (e+0 == 0)}')" = "1" ] && return
+    printf "€%s" "$eur"
+}
+
+# ============================================================
+#  Title parsing & type selection
+#  Sets:
+#    T_TYPE              - resolved or default type
+#    T_TITLE             - title with any prefix stripped
+#    T_TYPE_RESOLVED     - "yes" | "no" (was the type unambiguously
+#                          determined? if "yes" we skip the menu)
+#    T_AMBIGUOUS_LIST    - csv of candidate types (when ambiguous)
+# ============================================================
+parse_task_title() {
+    local input="$1"
+    T_AMBIGUOUS_LIST=""
+    local first_word="${input%% *}"
+    local has_rest="no"
+    [[ "$input" == *" "* ]] && has_rest="yes"
+
+    # 1. Try unique-prefix match if there's something after the
+    #    first word (so typing "or" alone doesn't get hijacked).
+    if [ "$has_rest" = "yes" ]; then
+        local m; m=$(match_type_prefix "$first_word")
+        local rc=$?
+        case $rc in
+            0)
+                T_TYPE="$m"
+                T_TITLE="${input#* }"
+                T_TYPE_RESOLVED="yes"
+                return
+                ;;
+            2)
+                # Ambiguous prefix - title is what's left after it.
+                T_AMBIGUOUS_LIST="${m#AMBIG:}"
+                T_TITLE="${input#* }"
+                T_TYPE=""
+                T_TYPE_RESOLVED="no"
+                return
+                ;;
+        esac
+    fi
+
+    # 2. Pattern detection - ticket / order
+    if [[ "$input" =~ (^|[[:space:]])#[0-9]{5,}([^0-9]|$) ]]; then
+        T_TYPE="ticket"; T_TITLE="$input"; T_TYPE_RESOLVED="yes"; return
+    fi
+    if [[ "$input" =~ (^|[[:space:]])[0-9]{8,}([^0-9]|$) ]]; then
+        T_TYPE="order";  T_TITLE="$input"; T_TYPE_RESOLVED="yes"; return
+    fi
+
+    # 3. Default
+    T_TYPE="task"; T_TITLE="$input"; T_TYPE_RESOLVED="yes"
+}
+
+# Show a numbered list of types and accept:
+#   - a number (1..N)
+#   - any unique prefix (case-insensitive)
+#   - empty input -> $1 default
+prompt_type_selection() {
+    local default="$1"
+    local i=1 t tc menu="" sc
+    declare -A type_idx
+    for t in "${TASK_TYPES[@]}"; do
+        type_idx[$i]="$t"
+        sc="${DEFAULT_SHORTCUT[$t]}"
+        if [ "$t" = "$default" ]; then
+            tc=$(type_color "$t")
+            menu+="  ${tc}${BOLD}${i})${t}${NC}${DIM}/${sc}${NC}"
+        else
+            menu+="  ${DIM}${i})${t}/${sc}${NC}"
+        fi
+        i=$((i+1))
+    done
+    echo -e "${DIM}type${NC}${menu}"
+    local choice
+    read -r -p "$(echo -ne "${DIM}type${NC} > ")" choice
+    if [ -z "$choice" ]; then
+        P_SELECTED_TYPE="$default"; return
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ -n "${type_idx[$choice]:-}" ]; then
+        P_SELECTED_TYPE="${type_idx[$choice]}"; return
+    fi
+    local m; m=$(match_type_prefix "$choice")
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        P_SELECTED_TYPE="$m"; return
+    fi
+    if is_known_type "$choice"; then
+        P_SELECTED_TYPE="$choice"; return
+    fi
+    echo -e "${YELLOW}invalid choice, using default: $default${NC}"
+    P_SELECTED_TYPE="$default"
+}
+
+# Prompt only between the candidates when an ambiguous prefix
+# was given. The user typed something like "t Foo" - here we
+# clarify whether "t" meant task or ticket.
+prompt_ambiguous_type() {
+    local csv="$1"
+    IFS=',' read -ra opts <<< "$csv"
+    echo -e "${YELLOW}prefix is ambiguous${NC}  ${DIM}pick one:${NC}"
+    local i=1 o tc
+    for o in "${opts[@]}"; do
+        tc=$(type_color "$o")
+        echo -e "  ${BOLD}${i})${NC} ${tc}${o}${NC}"
+        i=$((i+1))
+    done
+    local choice
+    read -r -p "$(echo -ne "${DIM}choose${NC} ${WHITE}[1]${NC} > ")" choice
+    [ -z "$choice" ] && choice=1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#opts[@]}" ]; then
+        P_SELECTED_TYPE="${opts[$((choice-1))]}"; return
+    fi
+    local m; m=$(match_type_prefix "$choice")
+    if [ $? -eq 0 ]; then
+        local cand
+        for cand in "${opts[@]}"; do
+            [ "$cand" = "$m" ] && { P_SELECTED_TYPE="$m"; return; }
+        done
+    fi
+    P_SELECTED_TYPE="${opts[0]}"
+    echo -e "${YELLOW}using ${P_SELECTED_TYPE}${NC}"
+}
+
+# ============================================================
+#  Display helpers
+# ============================================================
+type_color() {
+    case "$1" in
+        ticket)      echo -e "${YELLOW}" ;;
+        project)     echo -e "${MAGENTA}" ;;
+        order)       echo -e "${GREEN}" ;;
+        appointment) echo -e "${BLUE}" ;;
+        monitoring)  echo -e "${RED}" ;;
+        break)       echo -e "${GRAY}" ;;
+        task|*)      echo -e "${CYAN}" ;;
+    esac
+}
+
+# Pad plain text to N visible characters, then wrap with ANSI.
+# Uses character count (not byte count) so multibyte chars like
+# € or umlauts don't shift downstream columns. printf's %-Ns
+# pads by bytes, which would over-trim padding on these.
+pad_str() {
+    local text="$1" width="$2"
+    local truncated="${text:0:$width}"
+    local cur=${#truncated}
+    if (( cur < width )); then
+        printf "%s%*s" "$truncated" "$((width - cur))" ""
+    else
+        printf "%s" "$truncated"
+    fi
+}
+
+# Print one column of a row, applying color to a width-padded
+# plain text. Avoids ANSI-vs-printf alignment problems.
+col_painted() {
+    local text="$1" width="$2" color="$3"
+    local padded; padded=$(pad_str "$text" "$width")
+    printf "%b%s%b" "${color}" "$padded" "${NC}"
+}
+
+# Print the dim header row used by listings, search, stats.
+print_listing_header() {
+    local id_h time_h type_h title_h dur_h bill_h
+    id_h=$(pad_str "ID"       "$COL_ID")
+    time_h=$(pad_str "TIME"   "$COL_TIME")
+    type_h=$(pad_str "TYPE"   "$COL_TYPE")
+    title_h=$(pad_str "TITLE" "$COL_TITLE")
+    dur_h=$(pad_str "DUR"     "$COL_DUR")
+    bill_h=$(pad_str "BILLED" "$COL_BILL")
+    printf "  ${DIM}%s  %s  %s  %s  %s  %s${NC}\n" \
+        "$id_h" "$time_h" "$type_h" "$title_h" "$dur_h" "$bill_h"
+}
+
+# Build a horizontal rule the width of the listing table.
+print_listing_rule() {
+    local total=$((COL_ID + COL_TIME + COL_TYPE + COL_TITLE + COL_DUR + COL_BILL + 2*5))
+    local r=""; local i
+    for ((i=0; i<total; i++)); do r+="─"; done
+    printf "  ${DIM}%s${NC}\n" "$r"
+}
+
+# Render one task as a table row.
+print_task_row() {
+    local gid="$1" time_range="$2" task="$3" duration="$4" description="$5" type="${6:-task}" hours="${7:-}"
+
+    local id_text=""; [ -n "$gid" ] && id_text="$gid"
+    local id_col;    id_col=$(col_painted "$id_text"           "$COL_ID"    "$DIM")
+    local time_col;  time_col=$(col_painted "$time_range"      "$COL_TIME"  "$DIM")
+    local type_col;  type_col=$(col_painted "[$type]"          "$COL_TYPE"  "$(type_color "$type")")
+    local title_col; title_col=$(col_painted "$task"           "$COL_TITLE" "$WHITE")
+    local dur_col;   dur_col=$(col_painted "$duration"         "$COL_DUR"   "$DIM")
+
+    local bill_text="" bill_color="$DIM"
+    local hd; hd=$(format_hours "$hours")
+    if [ -n "$hd" ]; then
+        local eur; eur=$(format_eur_for_hours "$hours")
+        if [ -n "$eur" ]; then
+            bill_text="$hd $eur"; bill_color="$GREEN"
+        else
+            bill_text="$hd"
+        fi
+    else
+        bill_text="-"
+    fi
+    local bill_col; bill_col=$(col_painted "$bill_text" "$COL_BILL" "$bill_color")
+
+    printf "  %b  %b  %b  %b  %b  %b\n" \
+        "$id_col" "$time_col" "$type_col" "$title_col" "$dur_col" "$bill_col"
+
+    # Description (if present) on a continuation line, indented
+    # to the title column for readability. The "  " prefix in the
+    # printf format already accounts for the leading indent, so we
+    # only add the column widths + the three "  " separators.
+    if [ -n "$description" ]; then
+        local indent=$((COL_ID + COL_TIME + COL_TYPE + 2*3))
+        printf "  %*s${DIM}%s${NC}\n" "$indent" "" "$description"
+    fi
+}
+
+# Render a totals row (no ID, no description).
+print_totals_row() {
+    local label="$1" duration="$2" hours="$3"
+    local id_col;    id_col=$(col_painted ""           "$COL_ID"    "$DIM")
+    local time_col;  time_col=$(col_painted ""         "$COL_TIME"  "$DIM")
+    local type_col;  type_col=$(col_painted ""         "$COL_TYPE"  "$DIM")
+    local title_col; title_col=$(col_painted "$label"  "$COL_TITLE" "$BOLD$WHITE")
+    local dur_col;   dur_col=$(col_painted "$duration" "$COL_DUR"   "$WHITE")
+
+    local bill_text="-"; local bill_color="$DIM"
+    if [ -n "$hours" ] && [ "$(awk -v h="$hours" 'BEGIN{print (h+0>0)}')" = "1" ]; then
+        local hd; hd=$(format_hours "$hours")
+        local eur; eur=$(format_eur_for_hours "$hours")
+        if [ -n "$eur" ]; then bill_text="$hd $eur"; else bill_text="$hd"; fi
+        bill_color="$GREEN"
+    fi
+    local bill_col; bill_col=$(col_painted "$bill_text" "$COL_BILL" "$bill_color")
+
+    printf "  %b  %b  %b  %b  %b  %b\n" \
+        "$id_col" "$time_col" "$type_col" "$title_col" "$dur_col" "$bill_col"
+}
+
+# ============================================================
+#  Listing
+# ============================================================
+list_scope() {
+    build_index
+    if [ "$(index_count)" -eq 0 ]; then
+        echo -e "${YELLOW}no tasks in scope:${NC} $SCOPE_LABEL"
+        return
+    fi
+    print_listing_header
+    print_listing_rule
+
+    local cur="" total=0 count=0 hours_total="0"
+    while IFS='|' read -r gid file line date time_range task duration description type hours; do
+        if [ "$date" != "$cur" ]; then
+            [ -n "$cur" ] && echo
+            printf "  ${DIM}%s${NC}\n" "$date"
+            cur="$date"
+        fi
+        print_task_row "$gid" "$time_range" "$task" "$duration" "$description" "$type" "$hours"
+        total=$((total + $(duration_to_minutes "$duration")))
+        count=$((count + 1))
+        if hours_is_billed "$hours"; then
+            hours_total=$(awk -v a="$hours_total" -v b="$hours" 'BEGIN{printf "%.2f", a+b}')
+        fi
+    done < "$INDEX_FILE"
+
+    print_listing_rule
+    local label
+    if [ $count -eq 1 ]; then label="1 task"; else label="$count tasks"; fi
+    print_totals_row "$label" "$(format_minutes $total)" "$hours_total"
+}
+
+show_last() {
+    build_index
+    local count="${1:-5}"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=5
+    if [ "$(index_count)" -eq 0 ]; then
+        echo -e "${YELLOW}no tasks in scope:${NC} $SCOPE_LABEL"
+        return
+    fi
+    print_listing_header
+    print_listing_rule
+    local cur=""
+    tail -n "$count" "$INDEX_FILE" | while IFS='|' read -r gid file line date time_range task duration description type hours; do
+        if [ "$date" != "$cur" ]; then
+            [ -n "$cur" ] && echo
+            printf "  ${DIM}%s${NC}\n" "$date"
+            cur="$date"
+        fi
+        print_task_row "$gid" "$time_range" "$task" "$duration" "$description" "$type" "$hours"
+    done
+}
+
+# ============================================================
+#  Stats
+# ============================================================
+print_kv_row() {
+    local label="$1" value="$2"
+    printf "  ${DIM}%-14s${NC}  ${WHITE}%s${NC}\n" "$label" "$value"
+}
+
+print_kv_row_color() {
+    local label="$1" value="$2" color="$3"
+    printf "  ${DIM}%-14s${NC}  %b%s%b\n" "$label" "$color" "$value" "$NC"
+}
+
+show_stats() {
+    build_index
+    if [ "$(index_count)" -eq 0 ]; then
+        echo -e "${YELLOW}no tasks in scope:${NC} $SCOPE_LABEL"
+        return
+    fi
+
+    local sort_file; sort_file=$(mktemp)
+    local total=0 count=0 mn=999999 mx=0 m
+    declare -A type_count type_minutes
+    local free_count=0 free_minutes=0
+    local billed_count=0 billed_worked_minutes=0
+    local billed_hours_total="0"
+
+    while IFS='|' read -r gid file line date time_range task duration description type hours; do
+        m=$(duration_to_minutes "$duration")
+        printf "%06d|%s|%s|%s|%s|%s|%s|%s\n" "$m" "$date" "$time_range" "$task" "$duration" "$description" "$type" "$hours" >> "$sort_file"
+        total=$((total + m))
+        count=$((count + 1))
+        [ $m -lt $mn ] && mn=$m
+        [ $m -gt $mx ] && mx=$m
+
+        local tk="${type:-task}"
+        type_count[$tk]=$(( ${type_count[$tk]:-0} + 1 ))
+        type_minutes[$tk]=$(( ${type_minutes[$tk]:-0} + m ))
+
+        if hours_is_billed "$hours"; then
+            billed_count=$((billed_count + 1))
+            billed_worked_minutes=$((billed_worked_minutes + m))
+            billed_hours_total=$(awk -v a="$billed_hours_total" -v b="$hours" 'BEGIN{printf "%.2f", a+b}')
+        else
+            free_count=$((free_count + 1))
+            free_minutes=$((free_minutes + m))
+        fi
+    done < "$INDEX_FILE"
+
+    print_listing_header
+    print_listing_rule
+    sort -n -t'|' -k1 "$sort_file" | while IFS='|' read -r key date time_range task duration description type hours; do
+        local prefixed="$date $time_range"
+        print_task_row "" "$prefixed" "$task" "$duration" "$description" "$type" "$hours"
+    done
+    rm -f "$sort_file"
+    print_listing_rule
+    echo
+
+    # ---- Summary block ---------------------------------------
+    echo -e "  ${BOLD}summary${NC}"
+    print_kv_row "scope" "$SCOPE_LABEL"
+
+    local total_str
+    if [ $count -eq 1 ]; then
+        total_str="1 task, $(format_minutes $total)"
+    else
+        total_str="$count tasks, $(format_minutes $total)"
+    fi
+    print_kv_row "tasks" "$total_str"
+
+    if [ $count -gt 0 ]; then
+        local range_str="$(format_minutes $mn)–$(format_minutes $mx)"
+        [ "$mn" -eq "$mx" ] && range_str="$(format_minutes $mn)"
+        print_kv_row "average"  "$(format_minutes $((total / count)))"
+        print_kv_row "range"    "$range_str"
+    fi
+
+    # ---- By type ---------------------------------------------
+    if [ ${#type_count[@]} -gt 0 ]; then
+        echo
+        echo -e "  ${BOLD}by type${NC}"
+        printf "  ${DIM}%-14s  %5s  %10s${NC}\n" "type" "count" "duration"
+        local rule=""; local i
+        for ((i=0; i<33; i++)); do rule+="─"; done
+        printf "  ${DIM}%s${NC}\n" "$rule"
+        local tk
+        for tk in "${TASK_TYPES[@]}"; do
+            local c="${type_count[$tk]:-0}"
+            [ "$c" -eq 0 ] && continue
+            local mins="${type_minutes[$tk]:-0}"
+            local tc; tc=$(type_color "$tk")
+            printf "  %b%-14s%b  ${WHITE}%5d${NC}  %10s\n" \
+                "$tc" "$tk" "$NC" "$c" "$(format_minutes "$mins")"
+        done
+        for tk in "${!type_count[@]}"; do
+            if ! is_known_type "$tk"; then
+                local c="${type_count[$tk]}"
+                local mins="${type_minutes[$tk]}"
+                printf "  %-14s  ${WHITE}%5d${NC}  %10s\n" \
+                    "${tk:-(none)}" "$c" "$(format_minutes "$mins")"
+            fi
+        done
+    fi
+
+    # ---- Billing ---------------------------------------------
+    if [ "$free_count" -gt 0 ] || [ "$billed_count" -gt 0 ]; then
+        echo
+        echo -e "  ${BOLD}billing${NC}"
+        printf "  ${DIM}%-10s  %5s  %10s  %12s${NC}\n" "kind" "count" "worked" "billed"
+        local rule=""; local i
+        for ((i=0; i<46; i++)); do rule+="─"; done
+        printf "  ${DIM}%s${NC}\n" "$rule"
+
+        if [ "$free_count" -gt 0 ]; then
+            printf "  %-10s  ${WHITE}%5d${NC}  %10s  %12s\n" \
+                "free" "$free_count" "$(format_minutes "$free_minutes")" "-"
+        fi
+        if [ "$billed_count" -gt 0 ]; then
+            local eur; eur=$(format_eur_for_hours "$billed_hours_total")
+            local val
+            if [ -n "$eur" ]; then
+                val="$(format_hours "$billed_hours_total") $eur"
+            else
+                val="$(format_hours "$billed_hours_total") (set HOURLY_RATE)"
+            fi
+            printf "  ${GREEN}%-10s  %5d  %10s  %12s${NC}\n" \
+                "billed" "$billed_count" "$(format_minutes "$billed_worked_minutes")" "$val"
+        fi
+        if [ "$(awk -v r="$HOURLY_RATE" 'BEGIN{print (r+0>0)}')" = "1" ]; then
+            echo
+            printf "  ${DIM}rate %s/h${NC}\n" "€$HOURLY_RATE"
+        fi
+    fi
+}
+
+# ============================================================
+#  Search
+# ============================================================
+search_tasks() {
+    local term="$1"
+    if [ -z "$term" ]; then
+        echo -e "${RED}usage: grep <text> | grep <type> | grep type:<type>${NC}"; return
+    fi
+    build_index
+    if [ "$(index_count)" -eq 0 ]; then
+        echo -e "${YELLOW}no tasks in scope.${NC}"; return
+    fi
+
+    local mode="text" filter_type=""
+    if [[ "$term" == type:* ]]; then
+        mode="type"; filter_type="${term#type:}"
+    elif [[ "$term" != *" "* ]] && is_known_type "$term"; then
+        mode="type"; filter_type="$term"
+    elif [[ "$term" != *" "* ]]; then
+        # Allow grep <unique-prefix> to filter by type as well.
+        local m; m=$(match_type_prefix "$term")
+        if [ $? -eq 0 ] && [ -n "$m" ]; then
+            mode="type"; filter_type="$m"
+        fi
+    fi
+
+    local matches
+    if [ "$mode" = "type" ]; then
+        if ! is_known_type "$filter_type"; then
+            echo -e "${RED}unknown type '$filter_type'. known: ${TASK_TYPES[*]}${NC}"; return
+        fi
+        matches=$(awk -F'|' -v t="$filter_type" '$9 == t' "$INDEX_FILE")
+        echo -e "${DIM}filter:${NC} type = ${WHITE}$filter_type${NC}"
+    else
+        matches=$(grep -i -- "$term" "$INDEX_FILE" 2>/dev/null || true)
+        echo -e "${DIM}filter:${NC} text ~ ${WHITE}$term${NC}"
+    fi
+
+    if [ -z "$matches" ]; then
+        echo -e "${YELLOW}no tasks matching '$term' in scope:${NC} $SCOPE_LABEL"
+        return
+    fi
+
+    print_listing_header
+    print_listing_rule
+    local total=0 count=0 cur="" hours_total="0" billed_minutes=0 billed_count=0
+    while IFS='|' read -r gid file line date time_range task duration description type hours; do
+        if [ "$date" != "$cur" ]; then
+            [ -n "$cur" ] && echo
+            printf "  ${DIM}%s${NC}\n" "$date"
+            cur="$date"
+        fi
+        print_task_row "$gid" "$time_range" "$task" "$duration" "$description" "$type" "$hours"
+        local m; m=$(duration_to_minutes "$duration")
+        total=$((total + m))
+        count=$((count + 1))
+        if hours_is_billed "$hours"; then
+            hours_total=$(awk -v a="$hours_total" -v b="$hours" 'BEGIN{printf "%.2f", a+b}')
+            billed_minutes=$((billed_minutes + m))
+            billed_count=$((billed_count + 1))
+        fi
+    done <<< "$matches"
+    print_listing_rule
+
+    local match_word="matches"; [ $count -eq 1 ] && match_word="match"
+    print_totals_row "$count $match_word" "$(format_minutes $total)" "$hours_total"
+    if [ "$billed_count" -gt 0 ]; then
+        local eur; eur=$(format_eur_for_hours "$hours_total")
+        [ -z "$eur" ] && eur="(set HOURLY_RATE)"
+        echo
+        printf "  ${DIM}billed${NC}  ${GREEN}%d entries · %s worked → %s %s${NC}\n" \
+            "$billed_count" "$(format_minutes $billed_minutes)" \
+            "$(format_hours "$hours_total")" "$eur"
+    fi
+}
+
+# ============================================================
+#  Last-action tracking (for `edit` with no args)
+# ============================================================
+LAST_TASK_ID=""
+LAST_TASK_FILE=""
+LAST_TASK_LINE=""
+LAST_FIELD=""
+
+# After a write to a known file/line, recompute the GID by
+# rebuilding the index and finding the matching row.
+refresh_last_id() {
+    [ -n "$LAST_TASK_FILE" ] && [ -n "$LAST_TASK_LINE" ] || return
+    build_index
+    LAST_TASK_ID=$(awk -F'|' -v f="$LAST_TASK_FILE" -v l="$LAST_TASK_LINE" \
+        '$2==f && $3==l {print $1; exit}' "$INDEX_FILE")
+}
+
+# ============================================================
+#  Delete / Edit / Resume
+# ============================================================
+delete_task() {
+    local id="$1"
+    [ -s "$INDEX_FILE" ] || build_index
+    if [ "$(index_count)" -eq 0 ]; then
+        echo -e "${YELLOW}no tasks to delete in scope.${NC}"; return
+    fi
+    [ -z "$id" ] && id=$(tail -1 "$INDEX_FILE" | cut -d'|' -f1)
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}invalid task id. use: rm <number>${NC}"; return
+    fi
+    local entry; entry=$(index_lookup "$id")
+    if [ -z "$entry" ]; then
+        echo -e "${RED}task id $id not found in current scope.${NC}"; return
+    fi
+    parse_index_line "$entry"
+    local deleted_file="$I_FILE" deleted_line="$I_LINE"
+    sed -i "${I_LINE}d" "$I_FILE"
+    echo -e "${RED}─ deleted${NC}"
+    print_listing_header
+    print_listing_rule
+    print_task_row "" "$I_RANGE" "$I_TITLE" "$I_DUR" "$I_DESC" "$I_TYPE" "$I_HOURS"
+    [ -s "$I_FILE" ] || rm -f "$I_FILE"
+
+    # If we deleted the "last" task itself, clear the cache.
+    # Otherwise, if we deleted a line *above* the cached one in the
+    # same file, sed has just shifted line numbers up by 1 — adjust
+    # so refresh_last_id still finds the correct row.
+    if [ "$id" = "$LAST_TASK_ID" ]; then
+        LAST_TASK_ID=""; LAST_TASK_FILE=""; LAST_TASK_LINE=""; LAST_FIELD=""
+    elif [ -n "$LAST_TASK_FILE" ] && [ "$deleted_file" = "$LAST_TASK_FILE" ] \
+         && [ -n "$LAST_TASK_LINE" ] && [ "$deleted_line" -lt "$LAST_TASK_LINE" ]; then
+        LAST_TASK_LINE=$((LAST_TASK_LINE - 1))
+    fi
+    build_index
+    refresh_last_id
+}
+
+# Rebuild a CSV line from fields.
+build_line() {
+    echo "$1|$2-$3|$4|$5|$6|$7|$8"
+}
+
+# Replace line $I_LINE in $I_FILE with $1.
+write_back_line() {
+    local replacement="$1"
+    local esc; esc=$(escape_sed "$replacement")
+    sed -i "${I_LINE}s|.*|$esc|" "$I_FILE"
+}
+
+# Edit the full task interactively, top-to-bottom.
+edit_task_full() {
+    local id="$1"
+    [ -s "$INDEX_FILE" ] || build_index
+    if [ "$(index_count)" -eq 0 ]; then
+        echo -e "${YELLOW}no tasks to edit in scope.${NC}"; return 1
+    fi
+    [ -z "$id" ] && id=$(tail -1 "$INDEX_FILE" | cut -d'|' -f1)
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}invalid task id. use: edit <number>${NC}"; return 1
+    fi
+    local entry; entry=$(index_lookup "$id")
+    if [ -z "$entry" ]; then
+        echo -e "${RED}task id $id not found in current scope.${NC}"; return 1
+    fi
+    parse_index_line "$entry"
+    local old_start="${I_RANGE%%-*}" old_end="${I_RANGE##*-}"
+    local old_type="${I_TYPE:-task}"
+    local old_hours="${I_HOURS:-0.00}"
+
+    echo -e "${BLUE}● editing${NC}  ${DIM}#${I_GID}${NC}  ${WHITE}${I_TITLE}${NC}"
+
+    # Order: title -> start -> end -> type -> desc -> bill (last).
+    local new_title
+    read -r -p "$(echo -ne "${DIM}title${NC} ${WHITE}[${I_TITLE}]${NC} > ")" new_title
+    new_title=${new_title:-$I_TITLE}
+    new_title=$(sanitize_pipe "$new_title")
+
+    local new_start; new_start=$(read_time "start" "$old_start")
+    local new_end;   new_end=$(read_time "end"   "$old_end")
+
+    prompt_type_selection "$old_type"
+    local new_type="$P_SELECTED_TYPE"
+
+    local new_description
+    read -r -p "$(echo -ne "${DIM}desc${NC} ${WHITE}[${I_DESC}]${NC} > ")" new_description
+    new_description=${new_description:-$I_DESC}
+    new_description=$(sanitize_pipe "$new_description")
+
+    local raw_h new_hours
+    read -r -p "$(echo -ne "${DIM}bill${NC} ${WHITE}[${old_hours}]${NC} > ")" raw_h
+    if [ -z "$raw_h" ]; then
+        new_hours=$(validate_hours "$old_hours")
+    else
+        if ! new_hours=$(validate_hours "$raw_h"); then
+            echo -e "${YELLOW}invalid hours, keeping ${old_hours}${NC}"
+            new_hours=$(validate_hours "$old_hours")
+        fi
+    fi
+
+    local new_duration; new_duration=$(calculate_duration "$new_start" "$new_end")
+    write_back_line "$(build_line "$I_DATE" "$new_start" "$new_end" "$new_title" "$new_duration" "$new_description" "$new_type" "$new_hours")"
+
+    echo -e "${GREEN}─ updated${NC}"
+    print_listing_header
+    print_listing_rule
+    print_task_row "" "$new_start-$new_end" "$new_title" "$new_duration" "$new_description" "$new_type" "$new_hours"
+
+    LAST_TASK_FILE="$I_FILE"
+    LAST_TASK_LINE="$I_LINE"
+    LAST_FIELD="bill"
+    refresh_last_id
+}
+
+# Edit only one specific field of a task. Used by `edit` (no args).
+edit_task_field() {
+    local id="$1" field="$2"
+    [ -s "$INDEX_FILE" ] || build_index
+    local entry; entry=$(index_lookup "$id")
+    if [ -z "$entry" ]; then
+        echo -e "${YELLOW}prior task is no longer in scope; falling back to full edit${NC}"
+        return 1
+    fi
+    parse_index_line "$entry"
+
+    local cur_start="${I_RANGE%%-*}" cur_end="${I_RANGE##*-}"
+    local cur_title="$I_TITLE"
+    local cur_type="${I_TYPE:-task}"
+    local cur_desc="$I_DESC"
+    local cur_hours="${I_HOURS:-0.00}"
+
+    case "$field" in
+        title)
+            local in
+            read -r -p "$(echo -ne "${DIM}title${NC} ${WHITE}[${cur_title}]${NC} > ")" in
+            [ -n "$in" ] && cur_title=$(sanitize_pipe "$in")
+            ;;
+        start)
+            cur_start=$(read_time "start" "$cur_start")
+            ;;
+        end)
+            cur_end=$(read_time "end" "$cur_end")
+            ;;
+        type)
+            prompt_type_selection "$cur_type"
+            cur_type="$P_SELECTED_TYPE"
+            ;;
+        desc)
+            local in
+            read -r -p "$(echo -ne "${DIM}desc${NC} ${WHITE}[${cur_desc}]${NC} > ")" in
+            [ -n "$in" ] && cur_desc=$(sanitize_pipe "$in")
+            ;;
+        bill)
+            local raw_h
+            read -r -p "$(echo -ne "${DIM}bill${NC} ${WHITE}[${cur_hours}]${NC} > ")" raw_h
+            if [ -n "$raw_h" ]; then
+                local v
+                if v=$(validate_hours "$raw_h"); then
+                    cur_hours="$v"
+                else
+                    echo -e "${YELLOW}invalid hours, keeping ${cur_hours}${NC}"
+                fi
+            fi
+            ;;
+        *)
+            echo -e "${YELLOW}don't know how to edit field '$field'; running full edit${NC}"
+            return 1
+            ;;
+    esac
+
+    local new_dur; new_dur=$(calculate_duration "$cur_start" "$cur_end")
+    write_back_line "$(build_line "$I_DATE" "$cur_start" "$cur_end" "$cur_title" "$new_dur" "$cur_desc" "$cur_type" "$cur_hours")"
+
+    echo -e "${GREEN}─ updated${NC} ${DIM}${field}${NC}"
+    print_listing_header
+    print_listing_rule
+    print_task_row "" "$cur_start-$cur_end" "$cur_title" "$new_dur" "$cur_desc" "$cur_type" "$cur_hours"
+
+    LAST_TASK_FILE="$I_FILE"
+    LAST_TASK_LINE="$I_LINE"
+    # LAST_FIELD stays the same so repeated `edit` keeps editing the same field.
+    refresh_last_id
+    return 0
+}
+
+resume_task() {
+    local id="$1"
+    [ -s "$INDEX_FILE" ] || build_index
+    if [ "$(index_count)" -eq 0 ]; then
+        echo -e "${YELLOW}nothing to resume in scope.${NC}"; return
+    fi
+    [ -z "$id" ] && id=$(tail -1 "$INDEX_FILE" | cut -d'|' -f1)
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}invalid task id.${NC}"; return
+    fi
+    local entry; entry=$(index_lookup "$id")
+    if [ -z "$entry" ]; then
+        echo -e "${RED}task id $id not found.${NC}"; return
+    fi
+    parse_index_line "$entry"
+    local resumed_input="$I_TITLE"
+    if [ -n "$I_TYPE" ] && [ "$I_TYPE" != "task" ]; then
+        resumed_input="$I_TYPE $I_TITLE"
+    fi
+    log_new_task "$resumed_input" "resumed"
+}
+
+# ============================================================
+#  Today's last entry helpers (used by break flow)
+# ============================================================
+last_today_line() {
+    local file; file=$(get_log_path "$(today_date)")
+    [ -f "$file" ] || return 1
+    tail -n 1 "$file"
+}
+
+extend_last_today_end() {
+    local new_end="$1"
+    local file; file=$(get_log_path "$(today_date)")
+    [ -f "$file" ] || return 1
+    local last; last=$(tail -n 1 "$file")
+    [ -z "$last" ] && return 1
+
+    local d tr title dur desc type hours
+    IFS='|' read -r d tr title dur desc type hours <<< "$last"
+    if ! [[ "$tr" =~ ^([0-9]{2}:[0-9]{2})-([0-9]{2}:[0-9]{2})$ ]]; then
+        return 1
+    fi
+    local s="${BASH_REMATCH[1]}"
+    local new_dur; new_dur=$(calculate_duration "$s" "$new_end")
+    local replacement="$d|$s-$new_end|$title|$new_dur|$desc|${type:-task}|${hours:-0.00}"
+    local line_num; line_num=$(wc -l < "$file")
+    local esc; esc=$(escape_sed "$replacement")
+    sed -i "${line_num}s|.*|$esc|" "$file"
+    return 0
+}
+
+# ============================================================
+#  Break flow
+# ============================================================
+handle_break_flow() {
+    local file; file=$(get_log_path "$(today_date)")
+    local last_line=""
+    [ -f "$file" ] && last_line=$(tail -n 1 "$file")
+
+    local break_start; break_start=$(date +%H:%M)
+    local break_start_ts; break_start_ts=$(date +%s)
+    local break_end; break_end=$(adjust_time "$break_start" $((BREAK_LENGTH/60)))
+
+    local extended_prev=false
+    if [ -n "$last_line" ]; then
+        if extend_last_today_end "$break_start"; then
+            extended_prev=true
+        fi
+    fi
+
+    echo
+    echo -e "${YELLOW}break${NC}     ${WHITE}${break_start}${NC} ${DIM}→${NC} ${WHITE}${break_end}${NC}"
+    if [ "$extended_prev" = true ]; then
+        local prev_title; prev_title=$(echo "$last_line" | awk -F'|' '{print $3}')
+        echo -e "${DIM}paused${NC}    ${WHITE}${prev_title}${NC} ${DIM}@ ${break_start}${NC}"
+    fi
+    echo
+
+    local end_ts=$((break_start_ts + BREAK_LENGTH))
+    local cancelled=0
+    local _line
+    local bar_len=20
+
+    while :; do
+        local now_ts; now_ts=$(date +%s)
+        if [ "$now_ts" -ge "$end_ts" ]; then break; fi
+        local remain=$((end_ts - now_ts))
+        local m=$((remain / 60)) s=$((remain % 60))
+        local elapsed=$((now_ts - break_start_ts))
+        local filled=$((elapsed * bar_len / BREAK_LENGTH))
+        local empty=$((bar_len - filled))
+        local bar="" i
+        for ((i=0; i<filled; i++)); do bar+="█"; done
+        for ((i=0; i<empty; i++)); do bar+="░"; done
+        printf "\r  ${DIM}remain${NC}   ${BOLD}${WHITE}%02d:%02d${NC}  ${MAGENTA}%s${NC}  ${DIM}(↵ to return early)${NC}   " \
+            "$m" "$s" "$bar"
+        if read -t 1 -r _line; then
+            cancelled=1
+            break
+        fi
+    done
+    printf "\r%-80s\r" ""
+
+    local return_ts; return_ts=$(date +%s)
+    local return_time; return_time=$(date -d "@$return_ts" +%H:%M)
+    local elapsed_sec=$((return_ts - break_start_ts))
+    local elapsed_min=$((elapsed_sec / 60))
+    local elapsed_rem=$((elapsed_sec % 60))
+
+    if [ "$cancelled" -eq 1 ] && [ "$elapsed_sec" -lt "$BREAK_LENGTH" ]; then
+        if [ "$extended_prev" = true ]; then
+            extend_last_today_end "$return_time"
+            local prev_title; prev_title=$(echo "$last_line" | awk -F'|' '{print $3}')
+            printf "  ${BLUE}● resumed${NC}  ${WHITE}%s${NC}  ${DIM}back after %dm %ds — same task continues${NC}\n" \
+                "$prev_title" "$elapsed_min" "$elapsed_rem"
+        else
+            printf "  ${BLUE}● back${NC}     ${DIM}after %dm %ds (no previous task today)${NC}\n" \
+                "$elapsed_min" "$elapsed_rem"
+        fi
+        echo
+        return
+    fi
+
+    if [[ "${LOG_BREAKS,,}" =~ ^(yes|true|y|1|on)$ ]]; then
+        local b_dur; b_dur=$(calculate_duration "$break_start" "$break_end")
+        ensure_log_path "$(today_date)" >/dev/null
+        echo "$(today_date)|$break_start-$break_end|break|$b_dur||break|0.00" >> "$file"
+        echo -e "  ${MAGENTA}─ break${NC}    logged"
+        print_listing_header
+        print_listing_rule
+        print_task_row "" "$break_start-$break_end" "break" "$b_dur" "" "break" "0.00"
+    else
+        printf "  ${MAGENTA}─ break${NC}    ${DIM}10m taken (not logged — LOG_BREAKS=no)${NC}\n"
+    fi
+
+    local end_ts_break=$((break_start_ts + BREAK_LENGTH))
+    if [ "$return_ts" -gt "$end_ts_break" ]; then
+        local tail_min=$(( (return_ts - end_ts_break + 30) / 60 ))
+        printf "  ${DIM}gap${NC}        ${DIM}%s → %s (%dm unlogged)${NC}\n" \
+            "$break_end" "$return_time" "$tail_min"
+    fi
+
+    if [ "$extended_prev" = true ]; then
+        echo
+        local resp
+        read -r -p "$(echo -ne "  ${BLUE}● back${NC}     ${DIM}resume previous task?${NC} ${WHITE}[Y/n]${NC} ${BOLD}>${NC} ")" resp
+        if [[ -z "$resp" || "${resp,,}" =~ ^(y|yes)$ ]]; then
+            local prev_title prev_type
+            prev_title=$(echo "$last_line" | awk -F'|' '{print $3}')
+            prev_type=$(echo  "$last_line" | awk -F'|' '{print $6}')
+            local resumed_input="$prev_title"
+            if [ -n "$prev_type" ] && [ "$prev_type" != "task" ]; then
+                resumed_input="$prev_type $prev_title"
+            fi
+            scope_set_today
+            build_index
+            log_new_task "$resumed_input" "resumed"
+        fi
+    fi
+    echo
+}
+
+# ============================================================
+#  New task logging
+# ============================================================
+log_new_task() {
+    local raw_input="$1"
+    local resumed="${2:-}"
+    raw_input=$(sanitize_pipe "$raw_input")
+
+    parse_task_title "$raw_input"
+    local title="$T_TITLE"
+
+    # Resolve type up-front so we can announce it before the
+    # description prompt. Skip the menu when unambiguous.
+    local type
+    if [ "$T_TYPE_RESOLVED" = "yes" ]; then
+        type="$T_TYPE"
+    else
+        # Ambiguous prefix: ask only between candidates.
+        prompt_ambiguous_type "$T_AMBIGUOUS_LIST"
+        type="$P_SELECTED_TYPE"
+    fi
+
+    local target_date="${ACTIVE_DATE:-$(today_date)}"
+    local start end description hours="0.00"
+
+    local plabel="$title"
+    [ ${#plabel} -gt 32 ] && plabel="${plabel:0:29}..."
+    local tc; tc=$(type_color "$type")
+
+    if [ "$target_date" = "$(today_date)" ]; then
+        start=$(date +%H:%M)
+        if [ -n "$resumed" ]; then
+            echo -e "${BLUE}● resumed${NC}  ${tc}[${type}]${NC} ${WHITE}${title}${NC}  ${DIM}@ ${start}${NC}"
+        else
+            echo -e "${GREEN}● started${NC}  ${tc}[${type}]${NC} ${WHITE}${title}${NC}  ${DIM}@ ${start}${NC}"
+        fi
+
+        echo "$title" > "$TEMP_FILE"
+        read -r -p "$(echo -ne "${CYAN}${plabel}${NC} > ")" description
+        end=$(date +%H:%M)
+        [ "$end" = "$start" ] && end=$(adjust_time "$end" 1)
+    else
+        echo -e "${YELLOW}● backfill${NC} ${DIM}${target_date}${NC}  ${tc}[${type}]${NC} ${WHITE}${title}${NC}"
+        start=$(read_time "start" "09:00")
+        local default_end; default_end=$(adjust_time "$start" 60)
+        end=$(read_time "end" "$default_end")
+        read -r -p "$(echo -ne "${CYAN}${plabel}${NC} > ")" description
+    fi
+
+    description=$(sanitize_pipe "$description")
+
+    local raw_h
+    read -r -p "$(echo -ne "${DIM}bill${NC} > ")" raw_h
+    if ! hours=$(validate_hours "$raw_h"); then
+        echo -e "${YELLOW}invalid hours, logged as 0${NC}"
+        hours="0.00"
+    fi
+
+    local duration; duration=$(calculate_duration "$start" "$end")
+    local file; file=$(ensure_log_path "$target_date")
+    echo "$target_date|$start-$end|$title|$duration|$description|$type|$hours" >> "$file"
+
+    echo -e "${GREEN}─ logged${NC}"
+    print_listing_header
+    print_listing_rule
+    print_task_row "" "$start-$end" "$title" "$duration" "$description" "$type" "$hours"
+    rm -f "$TEMP_FILE"
+
+    LAST_TASK_FILE="$file"
+    LAST_TASK_LINE=$(wc -l < "$file")
+    LAST_FIELD="bill"
+    refresh_last_id
+}
+
+# ============================================================
+#  Calendar view
+# ============================================================
+show_calendar() {
+    local arg="${1:-$(date +%Y-%m)}"
+    if ! [[ "$arg" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+        echo -e "${RED}format: cal YYYY-MM${NC}"; return
+    fi
+    local y="${arg%-*}" m="${arg#*-}"
+    local first_day="$y-$m-01"
+    if ! date -d "$first_day" +%s >/dev/null 2>&1; then
+        echo -e "${RED}invalid month: $arg${NC}"; return
+    fi
+    local month_name; month_name=$(date -d "$first_day" +"%B %Y")
+    local last_day_num; last_day_num=$(date -d "$first_day +1 month -1 day" +%d)
+    local first_dow; first_dow=$(date -d "$first_day" +%u)
+    local today_str; today_str=$(today_date)
+    local dir="$LOG_DIR/$y/$m"
+
+    declare -A day_count day_minutes
+    if [ -d "$dir" ]; then
+        local f
+        for f in "$dir"/*-tasks.csv; do
+            [ -f "$f" ] || continue
+            local fname; fname=$(basename "$f")
+            local d="${fname%-tasks.csv}"
+            local dd="${d##*-}"
+            local n=0 mins=0 dt tr ttl dur desc type hours
+            while IFS='|' read -r dt tr ttl dur desc type hours; do
+                [ -z "$dt" ] && continue
+                n=$((n+1))
+                mins=$((mins + $(duration_to_minutes "$dur")))
+            done < "$f"
+            day_count[$dd]=$n
+            day_minutes[$dd]=$mins
+        done
+    fi
+
+    echo
+    printf "  ${BOLD}%*s${NC}\n" 22 "$month_name"
+    echo -e "  ${MAGENTA}Mo Tu We Th Fr Sa Su${NC}"
+
+    printf "  "
+    local i
+    for ((i=1; i<first_dow; i++)); do printf "   "; done
+
+    local day=1 col=$first_dow
+    while [ $day -le $((10#$last_day_num)) ]; do
+        local dd; dd=$(printf "%02d" $day)
+        local full="$y-$m-$dd"
+        local cnt="${day_count[$dd]:-0}"
+        local color="$DIM"
+        [ "$cnt" -gt 0 ] && color="$GREEN"
+        [ "$full" = "$today_str" ] && color="${BOLD}${CYAN}"
+        printf "${color}%2d${NC} " "$day"
+        col=$((col + 1))
+        [ $col -gt 7 ] && { echo; printf "  "; col=1; }
+        day=$((day + 1))
+    done
+    [ $col -ne 1 ] && echo
+
+    local total_tasks=0 total_mins=0 active_days=0 dd
+    for dd in "${!day_count[@]}"; do
+        total_tasks=$((total_tasks + day_count[$dd]))
+        total_mins=$((total_mins + day_minutes[$dd]))
+        active_days=$((active_days + 1))
+    done
+    echo
+    printf "  ${DIM}%-13s${NC}  ${WHITE}%s${NC}\n" "active days" "$active_days"
+    printf "  ${DIM}%-13s${NC}  ${WHITE}%s${NC}\n" "tasks"       "$total_tasks"
+    printf "  ${DIM}%-13s${NC}  ${WHITE}%s${NC}\n" "time"        "$(format_minutes $total_mins)"
+}
+
+# ============================================================
+#  Migrate legacy flat-file logs
+# ============================================================
+migrate_legacy() {
+    local moved=0
+    shopt -s nullglob
+    local f
+    for f in "$LOG_DIR"/*-tasks.csv; do
+        [ -f "$f" ] || continue
+        local name; name=$(basename "$f")
+        local d="${name%-tasks.csv}"
+        if [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            local target; target=$(ensure_log_path "$d")
+            if [ "$f" != "$target" ]; then
+                mv -n "$f" "$target" && moved=$((moved + 1))
+            fi
+        fi
+    done
+    shopt -u nullglob
+    if [ $moved -gt 0 ]; then
+        echo -e "${GREEN}migrated $moved legacy log file(s) into year/month folders${NC}"
+    fi
+}
+
+# ============================================================
+#  ICS export + email
+# ============================================================
+escape_ics_text() {
+    local t="$1"
+    t="${t//\\/\\\\}"
+    t="${t//,/\\,}"
+    t="${t//;/\\;}"
+    t="${t//$'\n'/\\n}"
+    t="${t//$'\r'/\\r}"
+    echo "$t"
+}
+
+ics_dt() {
+    local d="$1" t="$2"
+    date -d "$d $t:00" +"%Y%m%dT%H%M%S" 2>/dev/null
+}
+
+ics_uid() {
+    local d="$1" s="$2" title="$3" h
+    h=$(printf '%s' "${d}T${s}:${title}" | sha256sum | cut -c1-16)
+    echo "timelog-${h}@local"
+}
+
+smtp_configured() {
+    [ -n "${SMTP_SERVER:-}" ] && [ -n "${SMTP_PORT:-}" ] && \
+    [ -n "${SMTP_USER:-}" ]   && [ -n "${SMTP_PASS:-}" ] && \
+    [ -n "${SMTP_FROM:-}" ]   && [ -n "${SMTP_TO:-}" ]
+}
+
+send_email() {
+    local ics_file="$1"
+    local subject="Task Log - $SCOPE_LABEL"
+    local body="Attached: tasks for $SCOPE_LABEL in ICS format."
+    local mf; mf=$(mktemp)
+    {
+        echo "From: $SMTP_FROM"
+        echo "To: $SMTP_TO"
+        echo "Subject: $subject"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: multipart/mixed; boundary=\"BOUNDARY123\""
+        echo
+        echo "--BOUNDARY123"
+        echo "Content-Type: text/plain; charset=UTF-8"
+        echo
+        echo "$body"
+        echo
+        echo "--BOUNDARY123"
+        echo "Content-Type: text/calendar; charset=UTF-8; name=\"$(basename "$ics_file")\""
+        echo "Content-Disposition: attachment; filename=\"$(basename "$ics_file")\""
+        echo "Content-Transfer-Encoding: base64"
+        echo
+        base64 -w 76 "$ics_file"
+        echo "--BOUNDARY123--"
+    } > "$mf"
+    local rc
+    if [[ "${SMTP_TLS:-}" == "yes" && "$SMTP_PORT" == "465" ]]; then
+        curl --ssl-reqd --url "smtps://$SMTP_SERVER:$SMTP_PORT" \
+             --user "$SMTP_USER:$SMTP_PASS" \
+             --mail-from "$SMTP_FROM" --mail-rcpt "$SMTP_TO" \
+             --upload-file "$mf" --silent --show-error
+        rc=$?
+    elif [[ "${SMTP_TLS:-}" == "yes" ]]; then
+        curl --url "smtp://$SMTP_SERVER:$SMTP_PORT" --ssl-reqd \
+             --user "$SMTP_USER:$SMTP_PASS" \
+             --mail-from "$SMTP_FROM" --mail-rcpt "$SMTP_TO" \
+             --upload-file "$mf" --silent --show-error
+        rc=$?
+    else
+        curl --url "smtp://$SMTP_SERVER:$SMTP_PORT" \
+             --user "$SMTP_USER:$SMTP_PASS" \
+             --mail-from "$SMTP_FROM" --mail-rcpt "$SMTP_TO" \
+             --upload-file "$mf" --silent --show-error
+        rc=$?
+    fi
+    rm -f "$mf"
+    return $rc
+}
+
+export_scope_to_ics() {
+    if [ "${#SCOPE_FILES[@]}" -eq 0 ]; then
+        echo -e "${YELLOW}nothing to export in scope:${NC} $SCOPE_LABEL"
+        return 1
+    fi
+    local stem
+    stem=$(echo "$SCOPE_LABEL" | tr ' /:>' '____' | tr -cd 'A-Za-z0-9_-')
+    [ -z "$stem" ] && stem="export"
+    local out="$EXPORT_DIR/timelog_${stem}_$(date +%Y%m%d_%H%M%S).ics"
+
+    local valid=0 invalid=0
+    {
+        echo "BEGIN:VCALENDAR"
+        echo "PRODID:-//Task Timer//EN"
+        echo "VERSION:2.0"
+        echo "CALSCALE:GREGORIAN"
+        echo "METHOD:PUBLISH"
+        echo "X-WR-CALNAME:Task Log"
+    } > "$out"
+
+    local f
+    for f in "${SCOPE_FILES[@]}"; do
+        [ -f "$f" ] || continue
+        while IFS='|' read -r d tr title dur desc type hours; do
+            [ -z "$d" ] && continue
+            if ! [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then invalid=$((invalid+1)); continue; fi
+            if ! [[ "$tr" =~ ^([0-9]{2}:[0-9]{2})-([0-9]{2}:[0-9]{2})$ ]]; then invalid=$((invalid+1)); continue; fi
+            local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
+            [ -z "$title" ] && { invalid=$((invalid+1)); continue; }
+            local sts; sts=$(ics_dt "$d" "$s")
+            local end_date="$d"
+            local s_epoch e_epoch
+            s_epoch=$(date -d "$d $s" +%s 2>/dev/null)
+            e_epoch=$(date -d "$d $e" +%s 2>/dev/null)
+            if [ -z "$sts" ] || [ -z "$s_epoch" ] || [ -z "$e_epoch" ]; then
+                invalid=$((invalid+1)); continue
+            fi
+            [ "$e_epoch" -lt "$s_epoch" ] && end_date=$(date -d "$d + 1 day" +%Y-%m-%d)
+            local ets; ets=$(ics_dt "$end_date" "$e")
+            [ -z "$ets" ] && { invalid=$((invalid+1)); continue; }
+
+            local type_tag="[$type] "
+            local h_disp; h_disp=$(format_hours "$hours")
+            local eur; eur=$(format_eur_for_hours "$hours")
+            local extra=""
+            [ -n "$h_disp" ] && extra=", billed: $h_disp"
+            [ -n "$eur" ] && extra="$extra = $eur"
+
+            local summary="${type_tag}${title} (${dur}${extra})"
+            local description="$desc"
+            [ -n "$type" ] && description="Type: $type"$'\n'"$description"
+            [ -n "$h_disp" ] && description="$description"$'\n'"Billable: $h_disp"
+            [ -n "$eur" ] && description="$description"$'\n'"Charge: $eur"
+
+            summary=$(escape_ics_text "$summary")
+            description=$(escape_ics_text "$description")
+            local uid; uid=$(ics_uid "$d" "$s" "$title")
+            local stamp; stamp=$(date -u +"%Y%m%dT%H%M%SZ")
+            {
+                echo "BEGIN:VEVENT"
+                echo "DTSTART:$sts"
+                echo "DTEND:$ets"
+                echo "DTSTAMP:$stamp"
+                echo "UID:$uid"
+                echo "CREATED:$stamp"
+                echo "LAST-MODIFIED:$stamp"
+                echo "SEQUENCE:0"
+                echo "STATUS:CONFIRMED"
+                echo "SUMMARY:$summary"
+                echo "DESCRIPTION:$description"
+                echo "TRANSP:OPAQUE"
+                [ -n "$type" ] && echo "CATEGORIES:$type"
+                echo "END:VEVENT"
+            } >> "$out"
+            valid=$((valid+1))
+        done < "$f"
+    done
+    echo "END:VCALENDAR" >> "$out"
+
+    if [ $valid -eq 0 ]; then
+        rm -f "$out"
+        echo -e "${YELLOW}no valid entries to export in scope:${NC} $SCOPE_LABEL"
+        return 1
+    fi
+    local skipped=""
+    [ $invalid -gt 0 ] && skipped=", $invalid skipped"
+    echo -e "${BLUE}─ ics${NC}      ${WHITE}$out${NC}  ${DIM}(${valid} events${skipped})${NC}"
+
+    if smtp_configured; then
+        echo -e "${BLUE}● sending${NC}  ${DIM}email...${NC}"
+        if send_email "$out"; then
+            echo -e "${GREEN}─ sent${NC}     ${WHITE}$SMTP_TO${NC}"
+        else
+            echo -e "${RED}─ failed${NC}   email send error"
+        fi
+    else
+        echo -e "${DIM}(SMTP not configured in profile - email skipped)${NC}"
+    fi
+}
+
+# ============================================================
+#  Profile command
+# ============================================================
+breaks_status_text() {
+    if [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]]; then
+        if [[ "${LOG_BREAKS,,}" =~ ^(yes|true|y|1|on)$ ]]; then
+            echo "enabled, logged"
+        else
+            echo "enabled, not logged"
+        fi
+    else
+        echo "disabled"
+    fi
+}
+
+breaks_status_color() {
+    if [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]]; then
+        if [[ "${LOG_BREAKS,,}" =~ ^(yes|true|y|1|on)$ ]]; then
+            echo "$GREEN"
+        else
+            echo "$WHITE"
+        fi
+    else
+        echo "$DIM"
+    fi
+}
+
+manage_profile() {
+    local sub="${1:-}"
+    case "$sub" in
+        ""|show|view)
+            local rate_disp="(unset)"
+            if [ "$(awk -v r="$HOURLY_RATE" 'BEGIN{print (r+0>0)}')" = "1" ]; then
+                rate_disp="€${HOURLY_RATE}/h"
+            fi
+            local breaks_disp; breaks_disp=$(breaks_status_text)
+            local breaks_col;  breaks_col=$(breaks_status_color)
+
+            local smtp_disp; smtp_disp="${RED}not configured${NC}"
+            if smtp_configured; then
+                smtp_disp="${GREEN}${SMTP_FROM} → ${SMTP_TO}${NC}"
+            fi
+
+            echo
+            echo -e "  ${BOLD}profile${NC}  ${DIM}${PROFILE_FILE/#$HOME/~}${NC}"
+            echo
+            printf "  ${DIM}%-14s${NC}  ${WHITE}%s${NC}\n"     "name"          "${NAME:-(unset)}"
+            printf "  ${DIM}%-14s${NC}  ${WHITE}%s${NC}\n"     "hourly rate"   "$rate_disp"
+            printf "  ${DIM}%-14s${NC}  %b%s%b\n"              "breaks"        "$breaks_col" "$breaks_disp" "$NC"
+            printf "  ${DIM}%-14s${NC}  %b\n"                  "smtp"          "$smtp_disp"
+            echo
+            echo -e "  ${DIM}profile edit  -  walk through values${NC}"
+            echo -e "  ${DIM}profile open  -  open in \$EDITOR (${EDITOR:-not set})${NC}"
+            ;;
+        edit)
+            interactive_profile_setup
+            load_profile
+            ;;
+        open)
+            local ed="${EDITOR:-}"
+            if [ -z "$ed" ]; then
+                ed="vi"
+                echo -e "${DIM}EDITOR not set, using vi${NC}"
+            fi
+            "$ed" "$PROFILE_FILE"
+            load_profile
+            echo -e "${GREEN}─ profile${NC}   reloaded"
+            ;;
+        *)
+            echo -e "${RED}usage: profile [show|edit|open]${NC}"
+            ;;
+    esac
+}
+
+# ============================================================
+#  Welcome and help
+# ============================================================
+show_welcome() {
+    local who="${NAME:-}"
+    if [ -z "$who" ] || [ "$who" = "you" ]; then
+        who=""
+    fi
+    # Linux-style date: e.g. "Tue May  5 11:18:42 AM CEST 2026"
+    local d_long; d_long=$(date '+%a %b %e %I:%M:%S %p %Z %Y')
+
+    local rate_disp
+    if [ "$(awk -v r="$HOURLY_RATE" 'BEGIN{print (r+0>0)}')" = "1" ]; then
+        rate_disp="€${HOURLY_RATE}/h"
+    else
+        rate_disp="(unset)"
+    fi
+
+    local breaks_disp; breaks_disp=$(breaks_status_text)
+    local breaks_col;  breaks_col=$(breaks_status_color)
+
+    local profile_short="${PROFILE_FILE/#$HOME/~}"
+
+    echo
+    echo -e "  ${BOLD}task-timer${NC} ${DIM}${VERSION}${NC}"
+    echo
+    if [ -n "$who" ]; then
+        printf "  ${DIM}%-9s${NC}  ${WHITE}%s${NC}\n" "user"    "$who"
+    fi
+    printf "  ${DIM}%-9s${NC}  ${GREEN}%s${NC}\n"        "rate"    "$rate_disp"
+    printf "  ${DIM}%-9s${NC}  %b%s%b\n"                 "breaks"  "$breaks_col" "$breaks_disp" "$NC"
+    printf "  ${DIM}%-9s${NC}  ${WHITE}%s${NC}\n"        "profile" "$profile_short"
+    printf "  ${DIM}%-9s${NC}  ${WHITE}%s${NC}\n"        "scope"   "$SCOPE_LABEL"
+    printf "  ${DIM}%-9s${NC}  ${WHITE}%s${NC}\n"        "now"     "$d_long"
+    echo
+    echo -e "  ${DIM}type a title to start, or 'help' for commands${NC}"
+    echo
+}
+
+show_full_help() {
+    local rate_note=""
+    if [ "$(awk -v r="$HOURLY_RATE" 'BEGIN{print (r+0>0)}')" = "1" ]; then
+        rate_note=" ${DIM}(€${HOURLY_RATE}/h)${NC}"
+    fi
+
+    echo
+    echo -e "  ${BOLD}task-timer${NC} ${DIM}commands${NC}"
+    echo
+    echo -e "  ${BOLD}LOGGING${NC}"
+    echo -e "    ${WHITE}<title>${NC}                  start task; timer begins immediately"
+    echo -e "    ${WHITE}<type-prefix> <title>${NC}    force type by any unique prefix"
+    echo -e "                             ${DIM}(e.g. mo / mon / monitor / monitoring)${NC}"
+    echo -e "    ${WHITE}resume${NC} [id]              continue last task (or chosen id)"
+    echo
+    echo -e "  ${BOLD}VIEW${NC}"
+    echo -e "    ${WHITE}all${NC}                      list current scope as a table"
+    echo -e "    ${WHITE}ls${NC} [n]                   last n entries (default 5)"
+    echo -e "    ${WHITE}stats${NC}                    summary, by-type, billing"
+    echo -e "    ${WHITE}grep${NC} <text>              search by title / desc"
+    echo -e "    ${WHITE}grep${NC} <type-prefix>       filter by type"
+    echo -e "    ${WHITE}grep${NC} type:<type>         explicit type filter"
+    echo
+    echo -e "  ${BOLD}EDIT${NC}"
+    echo -e "    ${WHITE}edit${NC}                     re-prompt the LAST field of the last task"
+    echo -e "    ${WHITE}edit${NC} <id>                full walkthrough on a task"
+    echo -e "    ${WHITE}rm${NC}   [id]                remove entry (last if id omitted)"
+    echo
+    echo -e "  ${BOLD}SCOPE${NC}"
+    echo -e "    ${WHITE}today${NC}                    reset scope to today"
+    echo -e "    ${WHITE}yesterday${NC}                -1 day from current scope (stackable)"
+    echo -e "    ${WHITE}tomorrow${NC}                 +1 day from current scope (stackable)"
+    echo -e "    ${WHITE}goto${NC} YYYY-MM-DD          jump to a specific date"
+    echo -e "    ${WHITE}month${NC} [YYYY-MM]          scope a whole month"
+    echo -e "    ${WHITE}year${NC}  [YYYY]             scope a whole year"
+    echo -e "    ${WHITE}range${NC} S E                scope an arbitrary range"
+    echo -e "    ${WHITE}cal${NC}   [YYYY-MM]          calendar grid with activity markers"
+    echo -e "    ${WHITE}scope${NC}                    print current scope info"
+    echo
+    echo -e "  ${BOLD}TOOLS${NC}"
+    echo -e "    ${WHITE}export${NC}                   write ICS, email if SMTP configured"
+    echo -e "    ${WHITE}profile${NC}                  show profile values"
+    echo -e "    ${WHITE}profile edit${NC}             walk through profile fields"
+    echo -e "    ${WHITE}profile open${NC}             open profile in \$EDITOR"
+    echo -e "    ${WHITE}migrate${NC}                  move legacy logs into year/month tree"
+    echo -e "    ${WHITE}clear${NC}                    clear screen"
+    echo -e "    ${WHITE}help${NC}                     this screen"
+    echo -e "    ${WHITE}quit${NC} | ${WHITE}exit${NC} | ${WHITE}q${NC}          leave"
+    echo
+    echo -e "  ${BOLD}STARTUP FLAGS${NC}"
+    echo -e "    ${WHITE}-d, --directory <dir>${NC}    scope to a directory recursively"
+    echo -e "                              ${DIM}(e.g. -d ~/.task_timer/2025)${NC}"
+    echo -e "    ${WHITE}-l, --log <file>${NC}         scope to a single log file"
+    echo
+    echo -e "  ${BOLD}TYPES${NC} ${DIM}(any unique prefix matches; ambiguous prompts to choose)${NC}"
+    local _t _sc _tc
+    for _t in "${TASK_TYPES[@]}"; do
+        _sc="${DEFAULT_SHORTCUT[$_t]}"
+        _tc=$(type_color "$_t")
+        printf "    ${_tc}%-13s${NC}  ${DIM}default shortcut: %s${NC}\n" "[$_t]" "$_sc"
+    done
+    echo
+    echo -e "  ${BOLD}DETECTION${NC}"
+    echo -e "    ${YELLOW}#NNNNN${NC}                  ${DIM}-> ticket  (# + 5+ digits)${NC}"
+    echo -e "    ${GREEN}NNNNNNNN${NC}                ${DIM}-> order   (8+ standalone digits)${NC}"
+    echo
+    echo -e "  ${BOLD}BILLING${NC}${rate_note}"
+    echo -e "    enter decimal hours when prompted: 1 = 1h, 0.5 = 30m, blank = free"
+    echo -e "    EUR is computed from HOURLY_RATE in the profile"
+    echo
+    echo -e "  ${BOLD}BREAKS${NC}"
+    echo -e "    breaks: ${WHITE}$(breaks_status_text)${NC}"
+    echo -e "    yes  ${DIM}->${NC} ends the current task at NOW, runs $((BREAK_LENGTH/60)):00 countdown"
+    echo -e "         ${DIM}->${NC} press enter to return early — same task continues"
+    echo -e "         ${DIM}->${NC} full break done — logs entry only when LOG_BREAKS=yes,"
+    echo -e "            then defaults to ${WHITE}resume${NC} of the prior task"
+    echo
+}
+
+# ============================================================
+#  Contextual main prompt
+# ============================================================
+fmt_main_prompt() {
+    local active="${ACTIVE_DATE:-$(today_date)}"
+    local today; today=$(today_date)
+
+    if [ -z "${ACTIVE_DATE:-}" ]; then
+        # Multi-day or non-date scope (range, month, year, dir, log).
+        echo -ne "${MAGENTA}[${SCOPE_LABEL}]${NC} ${BOLD}${WHITE}>${NC} "
+    elif [ "$active" = "$today" ]; then
+        echo -ne "${DIM}$(date +%H:%M)${NC} ${BOLD}${WHITE}>${NC} "
+    else
+        local short="$active"
+        if [ "$active" = "$(date -d '1 day ago' +%Y-%m-%d 2>/dev/null)" ]; then
+            short="yesterday"
+        elif [ "$active" = "$(date -d 'tomorrow' +%Y-%m-%d 2>/dev/null)" ]; then
+            short="tomorrow"
+        fi
+        echo -ne "${YELLOW}[${short}]${NC} ${BOLD}${WHITE}>${NC} "
+    fi
+}
+
+# ============================================================
+#  CLI flag parsing
+# ============================================================
+INITIAL_DIR=""
+INITIAL_LOG=""
+
+usage_cli() {
+    echo "Usage: $(basename "$0") [options]"
+    echo "  -d, --directory <dir>   recursively scope to a directory"
+    echo "  -l, --log <file>        scope to a single log file"
+    echo "  -h, --help              show this help and exit"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--directory)
+            if [ $# -lt 2 ]; then echo "missing argument for $1" >&2; exit 1; fi
+            INITIAL_DIR="$2"
+            shift 2
+            ;;
+        -l|--log)
+            if [ $# -lt 2 ]; then echo "missing argument for $1" >&2; exit 1; fi
+            INITIAL_LOG="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage_cli
+            exit 0
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            usage_cli
+            exit 1
+            ;;
+    esac
+done
+
+# ============================================================
+#  Main
+# ============================================================
+clear
+migrate_legacy
+
+if [ ! -f "$PROFILE_FILE" ]; then
+    echo -e "  ${BOLD}task-timer${NC} ${DIM}${VERSION}${NC}"
+    echo
+    echo -e "  ${YELLOW}no profile found${NC}  ${DIM}let's set one up${NC}"
+    interactive_profile_setup
+    echo
+    echo -e "  ${DIM}entering timer...${NC}"
+    sleep 1
+    clear
+fi
+
+load_profile
+
+# Apply CLI-driven scope, falling back to today.
+if [ -n "$INITIAL_LOG" ]; then
+    if ! scope_set_logfile "$INITIAL_LOG"; then exit 1; fi
+elif [ -n "$INITIAL_DIR" ]; then
+    if ! scope_set_directory "$INITIAL_DIR"; then exit 1; fi
+else
+    scope_set_today
+fi
+
+touch_timestamp
+start_break_watcher
+show_welcome
+
+while true; do
+    if [ -f "$ALERT_FILE" ]; then
+        rm -f "$ALERT_FILE"
+        echo
+        echo -e "  ${YELLOW}${BOLD}⚠ time for a break?${NC}  ${DIM}$((BREAK_INTERVAL/60)) min since last activity${NC}"
+        resp=$(prompt_yesno "take a $((BREAK_LENGTH/60)) min break?" "y")
+        if [ "$resp" = "y" ]; then
+            handle_break_flow
+        else
+            echo -e "  ${DIM}continuing — next nudge in $((BREAK_INTERVAL/60)) min${NC}"
+            echo
+        fi
+        touch_timestamp
+        continue
+    fi
+
+    if ! IFS= read -r -p "$(fmt_main_prompt)" input; then
+        echo
+        break
+    fi
+
+    cmd="${input%% *}"
+    args="${input#"$cmd"}"
+    args="${args# }"
+
+    case "$cmd" in
+        "" )
+            touch_timestamp; continue ;;
+        stats|stat )
+            show_stats; echo ;;
+        ls|list|last )
+            show_last "$args"; echo ;;
+        all )
+            list_scope; echo ;;
+        rm|del )
+            delete_task "$args"; echo ;;
+        edit )
+            if [ -z "$args" ]; then
+                if [ -n "$LAST_TASK_ID" ] && [ -n "$LAST_FIELD" ]; then
+                    if ! edit_task_field "$LAST_TASK_ID" "$LAST_FIELD"; then
+                        edit_task_full "$LAST_TASK_ID"
+                    fi
+                else
+                    echo -e "${YELLOW}nothing recent to edit — try 'edit <id>'${NC}"
+                fi
+            else
+                edit_task_full "$args"
+            fi
+            echo ;;
+        resume )
+            resume_task "$args"; echo ;;
+        grep|search )
+            search_tasks "$args"; echo ;;
+        export )
+            export_scope_to_ics; echo ;;
+        cal|calendar )
+            show_calendar "$args"; echo ;;
+        profile|config )
+            manage_profile "$args"; echo ;;
+        today )
+            scope_set_today
+            echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
+            echo ;;
+        yesterday )
+            if shift_active_date -1; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
+            fi
+            echo ;;
+        tomorrow )
+            if shift_active_date +1; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
+            fi
+            echo ;;
+        goto )
+            if [ -z "$args" ]; then
+                echo -e "${RED}usage: goto YYYY-MM-DD${NC}"
+            elif scope_set_date "$args"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
+            fi
+            echo ;;
+        month )
+            if scope_set_month "$args"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
+            fi
+            echo ;;
+        year )
+            if scope_set_year "$args"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
+            fi
+            echo ;;
+        range )
+            read -r s e _ <<< "$args"
+            if [ -z "$s" ] || [ -z "$e" ]; then
+                echo -e "${RED}usage: range YYYY-MM-DD YYYY-MM-DD${NC}"
+            elif scope_set_range "$s" "$e"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
+            fi
+            echo ;;
+        scope )
+            printf "  ${MAGENTA}%-12s${NC} %s\n" "scope"       "$SCOPE_LABEL"
+            printf "  ${MAGENTA}%-12s${NC} %s\n" "active date" "${ACTIVE_DATE:-(none)}"
+            printf "  ${MAGENTA}%-12s${NC} %s\n" "files"       "${#SCOPE_FILES[@]}"
+            for f in "${SCOPE_FILES[@]}"; do
+                [ -f "$f" ] && echo -e "    ${DIM}$f${NC}"
+            done
+            echo ;;
+        migrate )
+            migrate_legacy; echo ;;
+        clear )
+            clear ;;
+        help|"?" )
+            show_full_help ;;
+        quit|exit|q )
+            break ;;
+        * )
+            log_new_task "$input"
+            echo ;;
+    esac
+    touch_timestamp
+done
