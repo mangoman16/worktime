@@ -1971,20 +1971,35 @@ show_welcome() {
 #  Help (compact summary + per-command + topics + full)
 # ============================================================
 help_hint() {
-    echo -e "  ${DIM}type 'help <command>' for details   (e.g. 'help edit')${NC}"
-    echo -e "  ${DIM}topics: 'help types' 'help billing' 'help breaks' 'help flags'${NC}"
-    echo -e "  ${DIM}'help full' shows everything on one screen${NC}"
+    echo -e "  ${DIM}help <command>${NC}   ${DIM}details for one command   (e.g.${NC} ${WHITE}help edit${NC}${DIM})${NC}"
+    echo -e "  ${DIM}help <topic>${NC}     ${DIM}topics:${NC} ${WHITE}types${NC}${DIM} ·${NC} ${WHITE}billing${NC}${DIM} ·${NC} ${WHITE}breaks${NC}${DIM} ·${NC} ${WHITE}flags${NC}"
+    echo -e "  ${DIM}help full${NC}        ${DIM}everything on one screen${NC}"
+}
+
+# Render one category row: colored label + dot-separated command names.
+print_help_row() {
+    local label="$1" color="$2"; shift 2
+    local sep="${DIM} · ${NC}"
+    local line="" cmd first=1
+    for cmd in "$@"; do
+        if [ $first -eq 1 ]; then
+            line="${WHITE}${cmd}${NC}"; first=0
+        else
+            line+="${sep}${WHITE}${cmd}${NC}"
+        fi
+    done
+    printf "  ${color}%-7s${NC}   %b\n" "$label" "$line"
 }
 
 show_help() {
     echo
     echo -e "  ${BOLD}task-timer${NC} ${DIM}commands${NC}"
     echo
-    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "LOGGING" "<title>  <type> <title>  resume"
-    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "VIEW"    "all  ls  stats  grep"
-    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "EDIT"    "edit  title  desc  type  bill  rm"
-    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "SCOPE"   "today  yesterday  tomorrow  goto  month  year  range  cal  scope"
-    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "TOOLS"   "export  profile  migrate  clear  help  quit"
+    print_help_row "LOGGING" "$GREEN"   "<title>" "<type> <title>" "resume"
+    print_help_row "VIEW"    "$CYAN"    "all" "ls" "stats" "grep"
+    print_help_row "EDIT"    "$YELLOW"  "edit" "title" "desc" "type" "bill" "rm"
+    print_help_row "SCOPE"   "$MAGENTA" "today" "yesterday" "tomorrow" "goto" "month" "year" "range" "cal" "scope"
+    print_help_row "TOOLS"   "$BLUE"    "export" "profile" "migrate" "clear" "help" "quit"
     echo
     help_hint
     echo
