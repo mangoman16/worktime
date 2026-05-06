@@ -96,6 +96,24 @@ is_known_type() {
     return 1
 }
 
+# Shortest case-insensitive prefix of $1 that no other known type
+# also starts with. Used by help text so users see how few letters
+# they actually need to type.
+min_unique_prefix() {
+    local target="${1,,}" len=1 cand other ok
+    while [ "$len" -le "${#target}" ]; do
+        cand="${target:0:$len}"
+        ok=1
+        for other in "${TASK_TYPES[@]}"; do
+            [ "$other" = "$target" ] && continue
+            if [[ "${other,,}" == "$cand"* ]]; then ok=0; break; fi
+        done
+        if [ "$ok" -eq 1 ]; then echo "$cand"; return; fi
+        len=$((len+1))
+    done
+    echo "$target"
+}
+
 # Match a string against TASK_TYPES as a case-insensitive prefix.
 # Echoes:
 #   <type>             - if exactly one type starts with the string
@@ -2113,15 +2131,24 @@ show_help_command() {
 show_help_topic() {
     case "$1" in
         types|type-list)
-            echo -e "  ${BOLD}TYPES${NC} ${DIM}(any unique prefix matches; ambiguous prompts to choose)${NC}"
-            local _t _sc _tc
+            echo -e "  ${BOLD}TYPES${NC}"
+            echo -e "  ${DIM}any unique prefix maps to a type. ambiguous prefixes prompt;${NC}"
+            echo -e "  ${DIM}answer with the number, another prefix, or the full word.${NC}"
+            echo
+            local _t _tc _mp
             for _t in "${TASK_TYPES[@]}"; do
-                _sc="${DEFAULT_SHORTCUT[$_t]}"
                 _tc=$(type_color "$_t")
-                printf "    ${_tc}%-13s${NC}  ${DIM}default shortcut: %s${NC}\n" "[$_t]" "$_sc"
+                _mp=$(min_unique_prefix "$_t")
+                printf "    ${_tc}%-13s${NC}  ${DIM}starts with:${NC} ${WHITE}%s${NC}${DIM}…${NC}\n" "[$_t]" "$_mp"
             done
             echo
-            echo -e "  ${BOLD}DETECTION${NC}"
+            echo -e "  ${BOLD}EXAMPLES${NC}"
+            echo -e "    ${WHITE}m fix server${NC}         ${DIM}->${NC} ${RED}[monitoring]${NC} fix server"
+            echo -e "    ${WHITE}ti #12345 reset${NC}      ${DIM}->${NC} ${YELLOW}[ticket]${NC}     #12345 reset"
+            echo -e "    ${WHITE}appoint dentist${NC}      ${DIM}->${NC} ${MAGENTA}[appointment]${NC} dentist"
+            echo -e "    ${WHITE}t bug${NC}                ${DIM}->${NC} ${YELLOW}ambiguous${NC}, prompts ${DIM}(task / ticket)${NC}"
+            echo
+            echo -e "  ${BOLD}AUTO-DETECTION${NC}"
             echo -e "    ${YELLOW}#NNNNN${NC}                  ${DIM}-> ticket  (# + 5+ digits)${NC}"
             echo -e "    ${GREEN}NNNNNNNN${NC}                ${DIM}-> order   (8+ standalone digits)${NC}"
             return 0 ;;
@@ -2268,12 +2295,12 @@ show_full_help() {
     echo -e "                              ${DIM}(e.g. -d ~/.task_timer/2025)${NC}"
     echo -e "    ${WHITE}-l, --log <file>${NC}         scope to a single log file"
     echo
-    echo -e "  ${BOLD}TYPES${NC} ${DIM}(any unique prefix matches; ambiguous prompts to choose)${NC}"
-    local _t _sc _tc
+    echo -e "  ${BOLD}TYPES${NC} ${DIM}(any unique prefix maps to a type; ambiguous prefixes prompt)${NC}"
+    local _t _tc _mp
     for _t in "${TASK_TYPES[@]}"; do
-        _sc="${DEFAULT_SHORTCUT[$_t]}"
         _tc=$(type_color "$_t")
-        printf "    ${_tc}%-13s${NC}  ${DIM}default shortcut: %s${NC}\n" "[$_t]" "$_sc"
+        _mp=$(min_unique_prefix "$_t")
+        printf "    ${_tc}%-13s${NC}  ${DIM}starts with:${NC} ${WHITE}%s${NC}${DIM}…${NC}\n" "[$_t]" "$_mp"
     done
     echo
     echo -e "  ${BOLD}DETECTION${NC}"
