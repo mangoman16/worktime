@@ -1971,9 +1971,11 @@ show_welcome() {
 #  Help (compact summary + per-command + topics + full)
 # ============================================================
 help_hint() {
-    echo -e "  ${DIM}help <command>${NC}   ${DIM}details for one command   (e.g.${NC} ${WHITE}help edit${NC}${DIM})${NC}"
-    echo -e "  ${DIM}help <topic>${NC}     ${DIM}topics:${NC} ${WHITE}types${NC}${DIM} ·${NC} ${WHITE}billing${NC}${DIM} ·${NC} ${WHITE}breaks${NC}${DIM} ·${NC} ${WHITE}flags${NC}"
-    echo -e "  ${DIM}help full${NC}        ${DIM}everything on one screen${NC}"
+    echo -e "  ${BOLD}drill in${NC}"
+    echo -e "    ${WHITE}help <category>${NC}   ${GREEN}logging${NC}${DIM} ·${NC} ${CYAN}view${NC}${DIM} ·${NC} ${YELLOW}editing${NC}${DIM} ·${NC} ${MAGENTA}scoping${NC}${DIM} ·${NC} ${BLUE}tools${NC}"
+    echo -e "    ${WHITE}help <command>${NC}    ${DIM}any command listed above   (e.g.${NC} ${WHITE}help edit${NC}${DIM})${NC}"
+    echo -e "    ${WHITE}help <topic>${NC}      ${WHITE}types${NC}${DIM} ·${NC} ${WHITE}billing${NC}${DIM} ·${NC} ${WHITE}breaks${NC}${DIM} ·${NC} ${WHITE}flags${NC}"
+    echo -e "    ${WHITE}help full${NC}         ${DIM}everything on one screen${NC}"
 }
 
 # Render one category row: colored label + dot-separated command names.
@@ -2094,6 +2096,7 @@ show_help_command() {
             ;;
         help|"?")
             echo -e "  ${BOLD}help${NC}                         compact command summary"
+            echo -e "    ${WHITE}help <category>${NC}            logging · view · editing · scoping · tools"
             echo -e "    ${WHITE}help <command>${NC}             details for one command"
             echo -e "    ${WHITE}help <topic>${NC}               topic ref: types, billing, breaks, flags"
             echo -e "    ${WHITE}help full${NC}                  show everything on one screen"
@@ -2149,23 +2152,57 @@ show_help_topic() {
     return 1
 }
 
+# Category helpers: print every command in one category, in order.
+# Category names are distinct from command names (editing != edit) so
+# `help edit` and `help editing` resolve unambiguously.
+show_help_category() {
+    local cat label color cmds=()
+    case "$1" in
+        logging)
+            label="LOGGING"; color="$GREEN"
+            cmds=("log" "resume") ;;
+        view|viewing)
+            label="VIEW"; color="$CYAN"
+            cmds=("all" "ls" "stats" "grep") ;;
+        editing|edits)
+            label="EDIT"; color="$YELLOW"
+            cmds=("edit" "title" "desc" "type" "bill" "rm") ;;
+        scoping|scopes)
+            label="SCOPE"; color="$MAGENTA"
+            cmds=("today" "yesterday" "tomorrow" "goto" "month" "year" "range" "cal" "scope") ;;
+        tools|tooling)
+            label="TOOLS"; color="$BLUE"
+            cmds=("export" "profile" "migrate" "clear" "help" "quit") ;;
+        *) return 1 ;;
+    esac
+    echo -e "  ${BOLD}${color}${label}${NC}"
+    echo
+    local c
+    for c in "${cmds[@]}"; do
+        show_help_command "$c"
+    done
+    return 0
+}
+
 # `help [target]` dispatcher.
+# Lookup order: full -> command -> category -> topic.
 show_help_dispatch() {
     local target="$1"
     if [ -z "$target" ]; then
         show_help; return
     fi
     case "$target" in
-        full|all|verbose) show_full_help; return ;;
+        full|verbose) show_full_help; return ;;
     esac
     echo
     if show_help_command "$target"; then
-        echo
-        return
+        echo; return
+    fi
+    if show_help_category "$target"; then
+        echo; return
     fi
     if show_help_topic "$target"; then
-        echo
-        return
+        echo; return
     fi
     echo -e "  ${YELLOW}no help for '${target}'${NC}"
     echo
