@@ -1321,6 +1321,26 @@ edit_task_field() {
     return 0
 }
 
+# Edit one field of a specific task (or the last one). Used by the
+# `desc` / `title` / `bill` / `type` shortcut commands.
+edit_field_cmd() {
+    local field="$1" id="$2"
+    [ -s "$INDEX_FILE" ] || build_index
+    if [ "$(index_count)" -eq 0 ]; then
+        echo -e "${YELLOW}no tasks in scope.${NC}"; return 1
+    fi
+    if [ -z "$id" ]; then
+        id="${LAST_TASK_ID:-$(tail -1 "$INDEX_FILE" | cut -d'|' -f1)}"
+    fi
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}invalid task id. use: $field [id]${NC}"; return 1
+    fi
+    if ! edit_task_field "$id" "$field"; then
+        edit_task_full "$id"
+    fi
+    LAST_FIELD="$field"
+}
+
 resume_task() {
     local id="$1"
     [ -s "$INDEX_FILE" ] || build_index
@@ -1947,6 +1967,197 @@ show_welcome() {
     echo
 }
 
+# ============================================================
+#  Help (compact summary + per-command + topics + full)
+# ============================================================
+help_hint() {
+    echo -e "  ${DIM}type 'help <command>' for details   (e.g. 'help edit')${NC}"
+    echo -e "  ${DIM}topics: 'help types' 'help billing' 'help breaks' 'help flags'${NC}"
+    echo -e "  ${DIM}'help full' shows everything on one screen${NC}"
+}
+
+show_help() {
+    echo
+    echo -e "  ${BOLD}task-timer${NC} ${DIM}commands${NC}"
+    echo
+    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "LOGGING" "<title>  <type> <title>  resume"
+    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "VIEW"    "all  ls  stats  grep"
+    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "EDIT"    "edit  title  desc  type  bill  rm"
+    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "SCOPE"   "today  yesterday  tomorrow  goto  month  year  range  cal  scope"
+    printf "  ${BOLD}%-9s${NC} ${WHITE}%s${NC}\n" "TOOLS"   "export  profile  migrate  clear  help  quit"
+    echo
+    help_hint
+    echo
+}
+
+# Per-command details. Returns 1 if the name is unknown.
+show_help_command() {
+    local c="$1"
+    case "$c" in
+        # ---- LOGGING ----
+        log|"<title>"|title-cmd-fallback)
+            echo -e "  ${BOLD}<title>${NC}                       start a new task; timer begins immediately"
+            echo -e "    ${WHITE}<type-prefix> <title>${NC}      force a type by any unique prefix"
+            echo -e "                                  ${DIM}(e.g. mo / mon / monitor / monitoring)${NC}"
+            echo -e "    ${DIM}any input that isn't a known command is treated as a new task title.${NC}"
+            ;;
+        resume)
+            echo -e "  ${BOLD}resume${NC} [id]                  continue the last task, or a chosen id"
+            echo -e "    ${DIM}starts a new entry with the same title/type as the source task.${NC}"
+            ;;
+
+        # ---- VIEW ----
+        all)
+            echo -e "  ${BOLD}all${NC}                          list every entry in the current scope as a table"
+            ;;
+        ls|list|last)
+            echo -e "  ${BOLD}ls${NC} [n]                       show the last n entries (default 5)"
+            echo -e "    ${DIM}aliases: list, last${NC}"
+            ;;
+        stats|stat)
+            echo -e "  ${BOLD}stats${NC}                        summary, by-type breakdown, billing totals"
+            ;;
+        grep|search)
+            echo -e "  ${BOLD}grep${NC} <text>                  search titles / descriptions"
+            echo -e "    ${WHITE}grep <type-prefix>${NC}         filter by type prefix"
+            echo -e "    ${WHITE}grep type:<type>${NC}           explicit type filter"
+            echo -e "    ${DIM}aliases: search${NC}"
+            ;;
+
+        # ---- EDIT ----
+        edit)
+            echo -e "  ${BOLD}edit${NC}                         re-prompt the LAST field of the last task touched"
+            echo -e "    ${WHITE}edit <id>${NC}                  full walkthrough on a task"
+            echo -e "    ${DIM}for editing one specific field, use the dedicated commands below.${NC}"
+            ;;
+        title)
+            echo -e "  ${BOLD}title${NC} [id]                   edit the title of a task"
+            echo -e "    ${DIM}no id -> last task touched${NC}"
+            ;;
+        desc)
+            echo -e "  ${BOLD}desc${NC} [id]                    edit the description of a task"
+            echo -e "    ${DIM}no id -> last task touched${NC}"
+            ;;
+        type)
+            echo -e "  ${BOLD}type${NC} [id]                    change the type of a task"
+            echo -e "    ${DIM}no id -> last task touched; runs the type picker${NC}"
+            ;;
+        bill)
+            echo -e "  ${BOLD}bill${NC} [id]                    set billed hours on a task"
+            echo -e "    ${DIM}decimal hours: 1 = 1h, 0.5 = 30m, blank = free${NC}"
+            ;;
+        rm|del)
+            echo -e "  ${BOLD}rm${NC} [id]                      remove an entry (last if id omitted)"
+            echo -e "    ${DIM}aliases: del${NC}"
+            ;;
+
+        # ---- SCOPE ----
+        today)      echo -e "  ${BOLD}today${NC}                        reset scope to today" ;;
+        yesterday)  echo -e "  ${BOLD}yesterday${NC}                    shift -1 day from current scope (stackable)" ;;
+        tomorrow)   echo -e "  ${BOLD}tomorrow${NC}                     shift +1 day from current scope (stackable)" ;;
+        goto)       echo -e "  ${BOLD}goto${NC} YYYY-MM-DD              jump to a specific date" ;;
+        month)      echo -e "  ${BOLD}month${NC} [YYYY-MM]              scope a whole month (default: current)" ;;
+        year)       echo -e "  ${BOLD}year${NC}  [YYYY]                 scope a whole year  (default: current)" ;;
+        range)      echo -e "  ${BOLD}range${NC} S E                    scope an arbitrary date range" ;;
+        cal|calendar) echo -e "  ${BOLD}cal${NC}   [YYYY-MM]              calendar grid with activity markers" ;;
+        scope)      echo -e "  ${BOLD}scope${NC}                        print current scope info and files" ;;
+
+        # ---- TOOLS ----
+        export)
+            echo -e "  ${BOLD}export${NC}                       write ICS file; email it if SMTP is configured"
+            ;;
+        profile|config)
+            echo -e "  ${BOLD}profile${NC}                      show profile values"
+            echo -e "    ${WHITE}profile edit${NC}               walk through profile fields"
+            echo -e "    ${WHITE}profile open${NC}               open the profile file in \$EDITOR"
+            ;;
+        migrate)
+            echo -e "  ${BOLD}migrate${NC}                      move legacy logs into the year/month tree"
+            ;;
+        clear)
+            echo -e "  ${BOLD}clear${NC}                        clear the screen"
+            ;;
+        help|"?")
+            echo -e "  ${BOLD}help${NC}                         compact command summary"
+            echo -e "    ${WHITE}help <command>${NC}             details for one command"
+            echo -e "    ${WHITE}help <topic>${NC}               topic ref: types, billing, breaks, flags"
+            echo -e "    ${WHITE}help full${NC}                  show everything on one screen"
+            ;;
+        quit|exit|q)
+            echo -e "  ${BOLD}quit${NC} | ${BOLD}exit${NC} | ${BOLD}q${NC}              leave the timer"
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# Topic references.
+show_help_topic() {
+    case "$1" in
+        types|type-list)
+            echo -e "  ${BOLD}TYPES${NC} ${DIM}(any unique prefix matches; ambiguous prompts to choose)${NC}"
+            local _t _sc _tc
+            for _t in "${TASK_TYPES[@]}"; do
+                _sc="${DEFAULT_SHORTCUT[$_t]}"
+                _tc=$(type_color "$_t")
+                printf "    ${_tc}%-13s${NC}  ${DIM}default shortcut: %s${NC}\n" "[$_t]" "$_sc"
+            done
+            echo
+            echo -e "  ${BOLD}DETECTION${NC}"
+            echo -e "    ${YELLOW}#NNNNN${NC}                  ${DIM}-> ticket  (# + 5+ digits)${NC}"
+            echo -e "    ${GREEN}NNNNNNNN${NC}                ${DIM}-> order   (8+ standalone digits)${NC}"
+            return 0 ;;
+        billing|bill-topic)
+            local rate_note=""
+            if [ "$(awk -v r="$HOURLY_RATE" 'BEGIN{print (r+0>0)}')" = "1" ]; then
+                rate_note=" ${DIM}(€${HOURLY_RATE}/h)${NC}"
+            fi
+            echo -e "  ${BOLD}BILLING${NC}${rate_note}"
+            echo -e "    enter decimal hours when prompted: 1 = 1h, 0.5 = 30m, blank = free"
+            echo -e "    EUR is computed from HOURLY_RATE in the profile"
+            return 0 ;;
+        breaks|break-topic)
+            echo -e "  ${BOLD}BREAKS${NC}"
+            echo -e "    status: ${WHITE}$(breaks_status_text)${NC}"
+            echo -e "    yes  ${DIM}->${NC} ends the current task at NOW, runs $((BREAK_LENGTH/60)):00 countdown"
+            echo -e "         ${DIM}->${NC} press enter to return early — same task continues"
+            echo -e "         ${DIM}->${NC} full break done — logs entry only when LOG_BREAKS=yes,"
+            echo -e "            then defaults to ${WHITE}resume${NC} of the prior task"
+            return 0 ;;
+        flags|cli|startup)
+            echo -e "  ${BOLD}STARTUP FLAGS${NC}"
+            echo -e "    ${WHITE}-d, --directory <dir>${NC}    scope to a directory recursively"
+            echo -e "                              ${DIM}(e.g. -d ~/.task_timer/2025)${NC}"
+            echo -e "    ${WHITE}-l, --log <file>${NC}         scope to a single log file"
+            return 0 ;;
+    esac
+    return 1
+}
+
+# `help [target]` dispatcher.
+show_help_dispatch() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        show_help; return
+    fi
+    case "$target" in
+        full|all|verbose) show_full_help; return ;;
+    esac
+    echo
+    if show_help_command "$target"; then
+        echo
+        return
+    fi
+    if show_help_topic "$target"; then
+        echo
+        return
+    fi
+    echo -e "  ${YELLOW}no help for '${target}'${NC}"
+    echo
+    help_hint
+    echo
+}
+
 show_full_help() {
     local rate_note=""
     if [ "$(awk -v r="$HOURLY_RATE" 'BEGIN{print (r+0>0)}')" = "1" ]; then
@@ -1973,7 +2184,11 @@ show_full_help() {
     echo -e "  ${BOLD}EDIT${NC}"
     echo -e "    ${WHITE}edit${NC}                     re-prompt the LAST field of the last task"
     echo -e "    ${WHITE}edit${NC} <id>                full walkthrough on a task"
-    echo -e "    ${WHITE}rm${NC}   [id]                remove entry (last if id omitted)"
+    echo -e "    ${WHITE}title${NC} [id]               edit only the title"
+    echo -e "    ${WHITE}desc${NC}  [id]               edit only the description"
+    echo -e "    ${WHITE}type${NC}  [id]               change only the type"
+    echo -e "    ${WHITE}bill${NC}  [id]               set only the billed hours"
+    echo -e "    ${WHITE}rm${NC}    [id]               remove entry (last if id omitted)"
     echo
     echo -e "  ${BOLD}SCOPE${NC}"
     echo -e "    ${WHITE}today${NC}                    reset scope to today"
@@ -1993,7 +2208,7 @@ show_full_help() {
     echo -e "    ${WHITE}profile open${NC}             open profile in \$EDITOR"
     echo -e "    ${WHITE}migrate${NC}                  move legacy logs into year/month tree"
     echo -e "    ${WHITE}clear${NC}                    clear screen"
-    echo -e "    ${WHITE}help${NC}                     this screen"
+    echo -e "    ${WHITE}help${NC}                     compact summary  ${DIM}(help <cmd> for details)${NC}"
     echo -e "    ${WHITE}quit${NC} | ${WHITE}exit${NC} | ${WHITE}q${NC}          leave"
     echo
     echo -e "  ${BOLD}STARTUP FLAGS${NC}"
@@ -2167,6 +2382,14 @@ while true; do
                 edit_task_full "$args"
             fi
             echo ;;
+        title )
+            edit_field_cmd title "$args"; echo ;;
+        desc )
+            edit_field_cmd desc  "$args"; echo ;;
+        type )
+            edit_field_cmd type  "$args"; echo ;;
+        bill )
+            edit_field_cmd bill  "$args"; echo ;;
         resume )
             resume_task "$args"; echo ;;
         grep|search )
@@ -2229,7 +2452,7 @@ while true; do
         clear )
             clear ;;
         help|"?" )
-            show_full_help ;;
+            show_help_dispatch "$args" ;;
         quit|exit|q )
             break ;;
         * )
