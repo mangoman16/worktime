@@ -1985,9 +1985,9 @@ print_help_row() {
     local line="" cmd first=1
     for cmd in "$@"; do
         if [ $first -eq 1 ]; then
-            line="${WHITE}${cmd}${NC}"; first=0
+            line="${DIM}${cmd}${NC}"; first=0
         else
-            line+="${sep}${WHITE}${cmd}${NC}"
+            line+="${sep}${DIM}${cmd}${NC}"
         fi
     done
     printf "  ${color}%-7s${NC}   %b\n" "$label" "$line"
