@@ -7,24 +7,15 @@ day/week/month as ICS or to email.
 Logs live under `~/.task_timer/YYYY/MM/YYYY-MM-DD.csv`. Profile, hourly
 rate, and SMTP settings live in `~/.task_timer/profile`.
 
-## Install
+## Run
 
 ```sh
-git clone https://github.com/mangoman16/worktime.git
-cd worktime
-./install.sh                # symlinks to ~/.local/bin/worktime
-# or
-./install.sh /usr/local/bin
+./worktime
 ```
 
-Then run `worktime` from anywhere. On first launch it walks you through
-a profile setup.
-
-You can also just run the script directly:
-
-```sh
-./worktime.sh
-```
+On first launch it walks you through a profile setup. Drop the file
+somewhere on your `$PATH` (or symlink it) if you want to call it as
+`worktime` from anywhere.
 
 ## Quick reference
 
