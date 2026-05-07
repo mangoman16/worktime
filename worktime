@@ -1083,8 +1083,10 @@ search_tasks() {
     local label="" t v kind mp rc sep="${DIM} · ${NC}"
     for t in "${tokens[@]}"; do
         case "$t" in
-            title:*) kind="title"; v="${t#title:}" ;;
-            desc:*)  kind="desc";  v="${t#desc:}"  ;;
+            title:*)  kind="title";  v="${t#title:}"  ;;
+            desc:*)   kind="desc";   v="${t#desc:}"   ;;
+            dur:*)    kind="dur";    v="${t#dur:}"    ;;
+            billed:*) kind="billed"; v="${t#billed:}" ;;
             type:*)
                 kind="type"; v="${t#type:}"
                 if ! is_known_type "$v"; then
@@ -1102,10 +1104,12 @@ search_tasks() {
         esac
         KINDS+=("$kind"); VALUES+=("$v")
         case "$kind" in
-            title) label+="${label:+$sep}${DIM}title~${NC}${WHITE}${v}${NC}" ;;
-            desc)  label+="${label:+$sep}${DIM}desc~${NC}${WHITE}${v}${NC}"  ;;
-            type)  label+="${label:+$sep}${DIM}type=${NC}${WHITE}${v}${NC}"  ;;
-            text)  label+="${label:+$sep}${DIM}any~${NC}${WHITE}${v}${NC}"   ;;
+            title)  label+="${label:+$sep}${DIM}title~${NC}${WHITE}${v}${NC}"  ;;
+            desc)   label+="${label:+$sep}${DIM}desc~${NC}${WHITE}${v}${NC}"   ;;
+            type)   label+="${label:+$sep}${DIM}type=${NC}${WHITE}${v}${NC}"   ;;
+            dur)    label+="${label:+$sep}${DIM}dur~${NC}${WHITE}${v}${NC}"    ;;
+            billed) label+="${label:+$sep}${DIM}billed~${NC}${WHITE}${v}${NC}" ;;
+            text)   label+="${label:+$sep}${DIM}any~${NC}${WHITE}${v}${NC}"    ;;
         esac
     done
 
@@ -1121,9 +1125,11 @@ search_tasks() {
         for ((i=0; i<${#KINDS[@]}; i++)); do
             k="${KINDS[$i]}"; vv="${VALUES[$i]}"
             case "$k" in
-                title) [[ "$ttl_lc"  == *"${vv,,}"* ]] || { ok=0; break; } ;;
-                desc)  [[ "$desc_lc" == *"${vv,,}"* ]] || { ok=0; break; } ;;
-                type)  [ "$_type" = "$vv" ] || { ok=0; break; } ;;
+                title)  [[ "$ttl_lc"        == *"${vv,,}"* ]] || { ok=0; break; } ;;
+                desc)   [[ "$desc_lc"       == *"${vv,,}"* ]] || { ok=0; break; } ;;
+                type)   [ "$_type" = "$vv" ] || { ok=0; break; } ;;
+                dur)    [[ "${_dur,,}"      == *"${vv,,}"* ]] || { ok=0; break; } ;;
+                billed) [[ "${_hours,,}"    == *"${vv,,}"* ]] || { ok=0; break; } ;;
                 text)
                 local needle="${vv,,}"
                 [[ "$ttl_lc" == *"$needle"* \
@@ -1644,6 +1650,7 @@ log_new_task() {
 # ============================================================
 show_calendar() {
     local arg="${1:-$(date +%Y-%m)}"
+    local mode="${2:-full}"
     if ! [[ "$arg" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
         echo -e "${RED}format: cal YYYY-MM${NC}"; return
     fi
@@ -1699,6 +1706,8 @@ show_calendar() {
         day=$((day + 1))
     done
     [ $col -ne 1 ] && echo
+
+    [ "$mode" = "minimal" ] && return
 
     local total_tasks=0 total_mins=0 active_days=0 dd
     for dd in "${!day_count[@]}"; do
@@ -2097,12 +2106,13 @@ show_help_command() {
             ;;
         grep|search)
             echo -e "  ${BOLD}grep${NC} <term> [<term>...]      filter the scope by one or more terms (ANDed)"
-            echo -e "    ${WHITE}title:<text>${NC}               match the title  ${DIM}(case-insensitive substring)${NC}"
+            echo -e "    ${WHITE}title:<text>${NC}               match the title    ${DIM}(case-insensitive substring)${NC}"
             echo -e "    ${WHITE}desc:<text>${NC}                match the description"
-            echo -e "    ${WHITE}type:<prefix>${NC}              match the type   ${DIM}(any unique prefix)${NC}"
-            echo -e "    ${WHITE}<bare-text>${NC}                substring across ${DIM}every${NC} field:"
-            echo -e "                                title, desc, type, hours, time, date, duration"
-            echo -e "    ${DIM}examples:${NC} ${WHITE}grep server${NC}${DIM},${NC} ${WHITE}grep type:mo title:alert${NC}${DIM},${NC} ${WHITE}grep 09:00${NC}"
+            echo -e "    ${WHITE}type:<prefix>${NC}              match the type     ${DIM}(any unique prefix)${NC}"
+            echo -e "    ${WHITE}dur:<text>${NC}                 match the duration ${DIM}(e.g. dur:30, dur:1h)${NC}"
+            echo -e "    ${WHITE}billed:<text>${NC}              match the billed hours ${DIM}(e.g. billed:1.5)${NC}"
+            echo -e "    ${WHITE}<bare-text>${NC}                substring across ${DIM}every${NC} field"
+            echo -e "    ${DIM}examples:${NC} ${WHITE}grep server${NC}${DIM},${NC} ${WHITE}grep type:mo title:alert${NC}${DIM},${NC} ${WHITE}grep billed:1.5${NC}"
             echo -e "    ${DIM}aliases: search${NC}"
             ;;
 
@@ -2307,7 +2317,9 @@ show_full_help() {
     echo -e "      ${WHITE}title:<text>${NC}          match title (substring, case-insensitive)"
     echo -e "      ${WHITE}desc:<text>${NC}           match description"
     echo -e "      ${WHITE}type:<prefix>${NC}         match type (any unique prefix)"
-    echo -e "      ${WHITE}<bare-text>${NC}           substring across every field (title/desc/type/hours/time/...)"
+    echo -e "      ${WHITE}dur:<text>${NC}            match duration"
+    echo -e "      ${WHITE}billed:<text>${NC}         match billed hours"
+    echo -e "      ${WHITE}<bare-text>${NC}           substring across every field"
     echo
     echo -e "  ${BOLD}EDIT${NC}"
     echo -e "    ${WHITE}edit${NC}                     re-prompt the LAST field of the last task"
@@ -2459,8 +2471,8 @@ fi
 
 touch_timestamp
 start_break_watcher
+show_calendar "" minimal
 show_welcome
-show_calendar
 
 while true; do
     if [ -f "$ALERT_FILE" ]; then
