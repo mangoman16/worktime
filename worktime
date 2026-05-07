@@ -1387,6 +1387,65 @@ edit_task_field() {
 }
 
 # Edit one field of a specific task (or the last one). Used by the
+show_edit_help() {
+    echo
+    echo -e "  ${BOLD}edit${NC}                    re-prompt last edited field of last task"
+    echo -e "  ${BOLD}edit${NC} <id>               full walkthrough on a task"
+    echo -e "  ${BOLD}edit${NC} <field> [id]       edit one field   ${DIM}(no id -> last task)${NC}"
+    echo
+    echo -e "  ${BOLD}fields${NC}"
+    echo -e "    ${WHITE}title${NC}                 rename a task"
+    echo -e "    ${WHITE}desc${NC}                  change the description"
+    echo -e "    ${WHITE}type${NC}                  change the type (prompts type picker)"
+    echo -e "    ${WHITE}start${NC}                 change start time"
+    echo -e "    ${WHITE}end${NC}                   change end time"
+    echo -e "    ${WHITE}bill${NC}                  set billed hours"
+    echo
+    echo -e "  ${DIM}standalone shortcuts:${NC} ${WHITE}title${NC}${DIM},${NC} ${WHITE}desc${NC}${DIM},${NC} ${WHITE}type${NC}${DIM},${NC} ${WHITE}bill${NC} ${DIM}(each takes optional id)${NC}"
+    echo
+}
+
+handle_edit_cmd() {
+    local args="$1"
+    if [ -z "$args" ]; then
+        if [ -n "$LAST_TASK_ID" ] && [ -n "$LAST_FIELD" ]; then
+            if ! edit_task_field "$LAST_TASK_ID" "$LAST_FIELD"; then
+                edit_task_full "$LAST_TASK_ID"
+            fi
+        else
+            echo -e "${YELLOW}nothing recent to edit — try 'edit <id>' or 'edit help'${NC}"
+        fi
+        return
+    fi
+
+    local first="${args%% *}"
+    local rest="${args#"$first"}"; rest="${rest# }"
+
+    case "$first" in
+        help|"?") show_edit_help; return ;;
+    esac
+
+    if [[ "$first" =~ ^[0-9]+$ ]]; then
+        edit_task_full "$first"
+        return
+    fi
+
+    local field=""
+    case "$first" in
+        title)              field="title" ;;
+        desc|description)   field="desc"  ;;
+        type)               field="type"  ;;
+        start)              field="start" ;;
+        end)                field="end"   ;;
+        bill|billed|hours)  field="bill"  ;;
+        *)
+            echo -e "${YELLOW}unknown edit target '$first' — try 'edit help'${NC}"
+            return ;;
+    esac
+
+    edit_field_cmd "$field" "$rest"
+}
+
 # `desc` / `title` / `bill` / `type` shortcut commands.
 edit_field_cmd() {
     local field="$1" id="$2"
@@ -1620,13 +1679,6 @@ log_new_task() {
 
     description=$(sanitize_pipe "$description")
 
-    local raw_h
-    read -r -p "$(echo -ne "${DIM}bill${NC} > ")" raw_h
-    if ! hours=$(validate_hours "$raw_h"); then
-        echo -e "${YELLOW}invalid hours, logged as 0${NC}"
-        hours="0.00"
-    fi
-
     local duration; duration=$(calculate_duration "$start" "$end")
     local file; file=$(ensure_log_path "$target_date")
     echo "$target_date|$start-$end|$title|$duration|$description|$type|$hours" >> "$file"
@@ -1639,7 +1691,7 @@ log_new_task() {
 
     LAST_TASK_FILE="$file"
     LAST_TASK_LINE=$(wc -l < "$file")
-    LAST_FIELD="bill"
+    LAST_FIELD="desc"
     refresh_last_id
 }
 
@@ -2116,9 +2168,11 @@ show_help_command() {
 
         # ---- EDIT ----
         edit)
-            echo -e "  ${BOLD}edit${NC}                         re-prompt the LAST field of the last task touched"
+            echo -e "  ${BOLD}edit${NC}                         re-prompt the LAST field of the last task"
             echo -e "    ${WHITE}edit <id>${NC}                  full walkthrough on a task"
-            echo -e "    ${DIM}for editing one specific field, use the dedicated commands below.${NC}"
+            echo -e "    ${WHITE}edit <field> [id]${NC}          edit one field (title, desc, type, start, end, bill)"
+            echo -e "    ${WHITE}edit help${NC}                  list editable fields"
+            echo -e "    ${DIM}standalone shortcuts:${NC} ${WHITE}title${NC}${DIM},${NC} ${WHITE}desc${NC}${DIM},${NC} ${WHITE}type${NC}${DIM},${NC} ${WHITE}bill${NC}"
             ;;
         title)
             echo -e "  ${BOLD}title${NC} [id]                   edit the title of a task"
@@ -2322,10 +2376,11 @@ show_full_help() {
     echo -e "  ${BOLD}EDIT${NC}"
     echo -e "    ${WHITE}edit${NC}                     re-prompt the LAST field of the last task"
     echo -e "    ${WHITE}edit${NC} <id>                full walkthrough on a task"
-    echo -e "    ${WHITE}title${NC} [id]               edit only the title"
-    echo -e "    ${WHITE}desc${NC}  [id]               edit only the description"
-    echo -e "    ${WHITE}type${NC}  [id]               change only the type"
-    echo -e "    ${WHITE}bill${NC}  [id]               set only the billed hours"
+    echo -e "    ${WHITE}edit${NC} <field> [id]        edit one field   ${DIM}(see 'edit help')${NC}"
+    echo -e "    ${WHITE}title${NC} [id]               shortcut: edit title"
+    echo -e "    ${WHITE}desc${NC}  [id]               shortcut: edit description"
+    echo -e "    ${WHITE}type${NC}  [id]               shortcut: edit type"
+    echo -e "    ${WHITE}bill${NC}  [id]               shortcut: set billed hours"
     echo -e "    ${WHITE}rm${NC}    [id]               remove entry (last if id omitted)"
     echo
     echo -e "  ${BOLD}SCOPE${NC}"
@@ -2509,18 +2564,7 @@ while true; do
         rm|del )
             delete_task "$args"; echo ;;
         edit )
-            if [ -z "$args" ]; then
-                if [ -n "$LAST_TASK_ID" ] && [ -n "$LAST_FIELD" ]; then
-                    if ! edit_task_field "$LAST_TASK_ID" "$LAST_FIELD"; then
-                        edit_task_full "$LAST_TASK_ID"
-                    fi
-                else
-                    echo -e "${YELLOW}nothing recent to edit — try 'edit <id>'${NC}"
-                fi
-            else
-                edit_task_full "$args"
-            fi
-            echo ;;
+            handle_edit_cmd "$args"; echo ;;
         title )
             edit_field_cmd title "$args"; echo ;;
         desc )
