@@ -1098,10 +1098,6 @@ search_tasks() {
                 ;;
             *)
                 kind="text"; v="$t"
-                mp=$(match_type_prefix "$t"); rc=$?
-                if [ "$rc" -eq 0 ] && [ -n "$mp" ]; then
-                    kind="type"; v="$mp"
-                fi
                 ;;
         esac
         KINDS+=("$kind"); VALUES+=("$v")
@@ -1109,7 +1105,7 @@ search_tasks() {
             title) label+="${label:+$sep}${DIM}title~${NC}${WHITE}${v}${NC}" ;;
             desc)  label+="${label:+$sep}${DIM}desc~${NC}${WHITE}${v}${NC}"  ;;
             type)  label+="${label:+$sep}${DIM}type=${NC}${WHITE}${v}${NC}"  ;;
-            text)  label+="${label:+$sep}${DIM}text~${NC}${WHITE}${v}${NC}"  ;;
+            text)  label+="${label:+$sep}${DIM}any~${NC}${WHITE}${v}${NC}"   ;;
         esac
     done
 
@@ -1128,7 +1124,15 @@ search_tasks() {
                 title) [[ "$ttl_lc"  == *"${vv,,}"* ]] || { ok=0; break; } ;;
                 desc)  [[ "$desc_lc" == *"${vv,,}"* ]] || { ok=0; break; } ;;
                 type)  [ "$_type" = "$vv" ] || { ok=0; break; } ;;
-                text)  [[ "$ttl_lc" == *"${vv,,}"* || "$desc_lc" == *"${vv,,}"* ]] || { ok=0; break; } ;;
+                text)
+                local needle="${vv,,}"
+                [[ "$ttl_lc" == *"$needle"* \
+                   || "$desc_lc" == *"$needle"* \
+                   || "${_type,,}" == *"$needle"* \
+                   || "${_hours,,}" == *"$needle"* \
+                   || "${_tr,,}" == *"$needle"* \
+                   || "${_date,,}" == *"$needle"* \
+                   || "${_dur,,}" == *"$needle"* ]] || { ok=0; break; } ;;
             esac
         done
         [ "$ok" -eq 1 ] && matches+="$line"$'\n'
@@ -2096,9 +2100,9 @@ show_help_command() {
             echo -e "    ${WHITE}title:<text>${NC}               match the title  ${DIM}(case-insensitive substring)${NC}"
             echo -e "    ${WHITE}desc:<text>${NC}                match the description"
             echo -e "    ${WHITE}type:<prefix>${NC}              match the type   ${DIM}(any unique prefix)${NC}"
-            echo -e "    ${WHITE}<bare-text>${NC}                if it's a unique type prefix -> filter by type,"
-            echo -e "                                otherwise match title or description"
-            echo -e "    ${DIM}examples:${NC} ${WHITE}grep type:mo${NC}${DIM},${NC} ${WHITE}grep title:server desc:reset${NC}"
+            echo -e "    ${WHITE}<bare-text>${NC}                substring across ${DIM}every${NC} field:"
+            echo -e "                                title, desc, type, hours, time, date, duration"
+            echo -e "    ${DIM}examples:${NC} ${WHITE}grep server${NC}${DIM},${NC} ${WHITE}grep type:mo title:alert${NC}${DIM},${NC} ${WHITE}grep 09:00${NC}"
             echo -e "    ${DIM}aliases: search${NC}"
             ;;
 
@@ -2303,7 +2307,7 @@ show_full_help() {
     echo -e "      ${WHITE}title:<text>${NC}          match title (substring, case-insensitive)"
     echo -e "      ${WHITE}desc:<text>${NC}           match description"
     echo -e "      ${WHITE}type:<prefix>${NC}         match type (any unique prefix)"
-    echo -e "      ${WHITE}<bare-text>${NC}           type-prefix if unique, else title/desc text"
+    echo -e "      ${WHITE}<bare-text>${NC}           substring across every field (title/desc/type/hours/time/...)"
     echo
     echo -e "  ${BOLD}EDIT${NC}"
     echo -e "    ${WHITE}edit${NC}                     re-prompt the LAST field of the last task"
