@@ -645,28 +645,35 @@ parse_task_title() {
     local has_rest="no"
     [[ "$input" == *" "* ]] && has_rest="yes"
 
-    # 1. Try unique-prefix match if there's something after the
-    #    first word (so typing "or" alone doesn't get hijacked).
-    if [ "$has_rest" = "yes" ]; then
-        local m; m=$(match_type_prefix "$first_word")
-        local rc=$?
-        case $rc in
-            0)
-                T_TYPE="$m"
+    # 1. Try unique-prefix match on the first word. Works for
+    #    'm fix server' (-> monitoring + title) and for bare
+    #    'm' (-> monitoring + empty title; caller will prompt).
+    local m rc
+    m=$(match_type_prefix "$first_word")
+    rc=$?
+    case $rc in
+        0)
+            T_TYPE="$m"
+            if [ "$has_rest" = "yes" ]; then
                 T_TITLE="${input#* }"
-                T_TYPE_RESOLVED="yes"
-                return
-                ;;
-            2)
-                # Ambiguous prefix - title is what's left after it.
-                T_AMBIGUOUS_LIST="${m#AMBIG:}"
+            else
+                T_TITLE=""
+            fi
+            T_TYPE_RESOLVED="yes"
+            return
+            ;;
+        2)
+            T_AMBIGUOUS_LIST="${m#AMBIG:}"
+            if [ "$has_rest" = "yes" ]; then
                 T_TITLE="${input#* }"
-                T_TYPE=""
-                T_TYPE_RESOLVED="no"
-                return
-                ;;
-        esac
-    fi
+            else
+                T_TITLE=""
+            fi
+            T_TYPE=""
+            T_TYPE_RESOLVED="no"
+            return
+            ;;
+    esac
 
     # 2. Pattern detection - ticket / order
     if [[ "$input" =~ (^|[[:space:]])#[0-9]{5,}([^0-9]|$) ]]; then
@@ -1648,6 +1655,18 @@ log_new_task() {
         # Ambiguous prefix: ask only between candidates.
         prompt_ambiguous_type "$T_AMBIGUOUS_LIST"
         type="$P_SELECTED_TYPE"
+    fi
+
+    # User typed only a type / type-prefix - ask for the title now.
+    if [ -z "$title" ]; then
+        local tc; tc=$(type_color "$type")
+        local raw_title
+        read -r -p "$(echo -ne "${tc}[${type}]${NC} ${DIM}title${NC} > ")" raw_title
+        title=$(sanitize_pipe "$raw_title")
+        if [ -z "$title" ]; then
+            echo -e "${YELLOW}cancelled — empty title${NC}"
+            return
+        fi
     fi
 
     local target_date="${ACTIVE_DATE:-$(today_date)}"
