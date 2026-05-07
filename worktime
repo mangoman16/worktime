@@ -62,6 +62,7 @@ BREAK_SKIPPED=()
 
 cleanup() {
     [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null
+    [ -n "${PROMPT_TICKER_PID:-}" ] && kill "$PROMPT_TICKER_PID" 2>/dev/null
     rm -f "$INDEX_FILE" "$TEMP_FILE" "$TS_FILE" "$ALERT_FILE" "$BREAK_DUE_FILE" "$LAST_END_FILE"
 }
 trap cleanup EXIT
@@ -1898,6 +1899,38 @@ handle_break_flow() {
 # ============================================================
 #  New task logging
 # ============================================================
+# Read the description prompt as a mini-CLI. The caller provides
+# the in-progress $type / $tc / $description via local variables;
+# this function loops, accepting:
+#   - single-word unique type prefix  -> change $type (and $tc), loop
+#   - q / quit / exit / abort / cancel -> abort task, return 1
+#   - anything else                    -> set $description, return 0
+prompt_description_for_task() {
+    while :; do
+        local raw
+        read -r -p "$(echo -ne "${tc}[${type}]${NC} ${BOLD}>${NC} ")" raw
+        local trimmed; trimmed=$(trim_ws "$raw")
+
+        if [ -n "$trimmed" ] && [[ "$trimmed" != *" "* ]]; then
+            case "${trimmed,,}" in
+                q|quit|exit|abort|cancel)
+                    echo -e "  ${YELLOW}● cancelled${NC}"
+                    return 1
+                    ;;
+            esac
+            local m; m=$(match_type_prefix "${trimmed,,}"); local rc=$?
+            if [ "$rc" -eq 0 ] && [ -n "$m" ] && [ "$m" != "$type" ]; then
+                type="$m"
+                tc=$(type_color "$type")
+                continue
+            fi
+        fi
+
+        description="$trimmed"
+        return 0
+    done
+}
+
 log_new_task() {
     local raw_input="$1"
     local resumed="${2:-}"
@@ -1936,7 +1969,7 @@ log_new_task() {
     fi
 
     local target_date="${ACTIVE_DATE:-$(today_date)}"
-    local start end description hours="0.00"
+    local start end description="" hours="0.00"
 
     local tc; tc=$(type_color "$type")
 
@@ -1951,7 +1984,10 @@ log_new_task() {
         fi
 
         echo "$title" > "$TEMP_FILE"
-        read -r -p "$(echo -ne "${tc}[${type}]${NC} ${BOLD}>${NC} ")" description
+        if ! prompt_description_for_task; then
+            rm -f "$TEMP_FILE"
+            return
+        fi
         end=$(date +%H:%M)
         [ "$end" = "$start" ] && end=$(adjust_time "$end" 1)
         local _end_ts; _end_ts=$(date +%s)
@@ -1961,10 +1997,13 @@ log_new_task() {
         start=$(read_time "start" "09:00")
         local default_end; default_end=$(adjust_time "$start" 60)
         end=$(read_time "end" "$default_end")
-        read -r -p "$(echo -ne "${tc}[${type}]${NC} ${BOLD}>${NC} ")" description
+        echo "$title" > "$TEMP_FILE"
+        if ! prompt_description_for_task; then
+            rm -f "$TEMP_FILE"
+            return
+        fi
     fi
 
-    description=$(trim_ws "$description")
     description=$(sanitize_pipe "$description")
 
     local duration; duration=$(calculate_duration "$start" "$end")
@@ -2667,10 +2706,10 @@ show_help_topic() {
             echo -e "    ${WHITE}t bug${NC}                ${DIM}->${NC} ${YELLOW}ambiguous${NC}, prompts ${DIM}(task / ticket)${NC}"
             echo
             echo -e "  ${BOLD}AUTO-DETECTION${NC}"
-            echo -e "    ${YELLOW}#NNNNN${NC}                  ${DIM}-> ticket   (# + 5+ digits)${NC}"
-            echo -e "    ${GREEN}NNNNNNNN${NC}                ${DIM}-> order    (8+ standalone digits)${NC}"
-            echo -e "    ${BLUE}termin${NC} / ${BLUE}appointment${NC}     ${DIM}-> appointment (word in the title)${NC}"
-            echo -e "    ${TEAL}tel${NC} / ${TEAL}telefon${NC} / ${TEAL}telephone${NC}  ${DIM}-> call${NC}"
+            printf "    ${YELLOW}%-26s${NC}${DIM}-> %s${NC}\n" "#NNNNN"                    "ticket       (# + 5+ digits)"
+            printf "    ${GREEN}%-26s${NC}${DIM}-> %s${NC}\n"  "NNNNNNNN"                  "order        (8+ standalone digits)"
+            printf "    ${BLUE}%-26s${NC}${DIM}-> %s${NC}\n"   "termin / appointment"      "appointment  (word in the title)"
+            printf "    ${TEAL}%-26s${NC}${DIM}-> %s${NC}\n"   "tel / telefon / telephone" "call"
             return 0 ;;
         billing|bill-topic)
             local rate_note=""
@@ -2862,10 +2901,10 @@ show_full_help() {
     done
     echo
     echo -e "  ${BOLD}DETECTION${NC}"
-    echo -e "    ${YELLOW}#NNNNN${NC}                  ${DIM}-> ticket   (# + 5+ digits)${NC}"
-    echo -e "    ${GREEN}NNNNNNNN${NC}                ${DIM}-> order    (8+ standalone digits)${NC}"
-    echo -e "    ${BLUE}termin${NC}/${BLUE}appointment${NC}       ${DIM}-> appointment (word in the title)${NC}"
-    echo -e "    ${TEAL}tel${NC}/${TEAL}telefon${NC}/${TEAL}telephone${NC}    ${DIM}-> call${NC}"
+    printf "    ${YELLOW}%-26s${NC}${DIM}-> %s${NC}\n" "#NNNNN"                    "ticket       (# + 5+ digits)"
+    printf "    ${GREEN}%-26s${NC}${DIM}-> %s${NC}\n"  "NNNNNNNN"                  "order        (8+ standalone digits)"
+    printf "    ${BLUE}%-26s${NC}${DIM}-> %s${NC}\n"   "termin / appointment"      "appointment  (word in the title)"
+    printf "    ${TEAL}%-26s${NC}${DIM}-> %s${NC}\n"   "tel / telefon / telephone" "call"
     echo
     echo -e "  ${BOLD}BILLING${NC}${rate_note}"
     echo -e "    enter decimal hours when prompted: 1 = 1h, 0.5 = 30m, blank = free"
@@ -2903,35 +2942,83 @@ fmt_main_prompt() {
     fi
 }
 
-# Compact break-status banner shown above each prompt iteration.
-# Empty when breaks are disabled or no current block.
-print_break_status_line() {
-    [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 0
-    [ "$BLOCK_START_TS" -le 0 ] && return 0
-    local now; now=$(date +%s)
-    local worked=$((now - BLOCK_START_TS))
-    local until_break=$((BREAK_NEXT_AT_TS - now))
-    local worked_min=$((worked / 60))
-    local block_min=$((BREAK_WORK_BLOCK / 60))
-    local req_min=$((BREAK_NEXT_DURATION_SEC / 60))
-    local skipped_n=${#BREAK_SKIPPED[@]}
+# Compose the current prompt line (no trailing newline). Format:
+#   [scope-tag]  HH:MM:SS - MM:SS  >
+# When breaks are disabled or no block is active, the countdown is
+# omitted and the prompt collapses to '[scope-tag]  HH:MM:SS  >'.
+fmt_live_prompt() {
+    local time_str; time_str=$(date +%H:%M:%S)
+    local active="${ACTIVE_DATE:-$(today_date)}"
+    local today; today=$(today_date)
 
-    local main_color="$DIM"
-    if [ "$until_break" -lt 600 ]; then main_color="$YELLOW"; fi
-    if [ "$until_break" -le 0 ];  then main_color="$RED";    fi
+    local scope_tag=""
+    if [ -z "${ACTIVE_DATE:-}" ]; then
+        scope_tag="${MAGENTA}[${SCOPE_LABEL}]${NC} "
+    elif [ "$active" != "$today" ]; then
+        local short="$active"
+        if [ "$active" = "$(date -d '1 day ago' +%Y-%m-%d 2>/dev/null)" ]; then
+            short="yesterday"
+        elif [ "$active" = "$(date -d 'tomorrow' +%Y-%m-%d 2>/dev/null)" ]; then
+            short="tomorrow"
+        fi
+        scope_tag="${YELLOW}[${short}]${NC} "
+    fi
 
-    local status
-    if [ "$until_break" -gt 0 ]; then
-        local rem_min=$((until_break / 60))
-        status=$(printf "%dm/%dm worked · break in %dm" "$worked_min" "$block_min" "$rem_min")
-    else
-        local over=$(( -until_break / 60 ))
-        status=$(printf "%dm/%dm worked · break OVERDUE %dm" "$worked_min" "$block_min" "$over")
+    local count_part=""
+    if [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] && [ "$BLOCK_START_TS" -gt 0 ]; then
+        local now; now=$(date +%s)
+        local until_break=$((BREAK_NEXT_AT_TS - now))
+        local color="$DIM"
+        if [ "$until_break" -lt 600 ]; then color="$YELLOW"; fi
+        if [ "$until_break" -le 0 ];  then color="$RED";    fi
+        local count
+        if [ "$until_break" -gt 0 ]; then
+            local m=$((until_break / 60)) s=$((until_break % 60))
+            count=$(printf "%02d:%02d" "$m" "$s")
+        else
+            local over=$(( -until_break ))
+            local m=$((over / 60)) s=$((over % 60))
+            count=$(printf "OVER+%02d:%02d" "$m" "$s")
+        fi
+        local skipped_n=${#BREAK_SKIPPED[@]}
+        if [ "$skipped_n" -gt 0 ]; then
+            count+=$(printf " (%d skip)" "$skipped_n")
+        fi
+        count_part=" ${DIM}-${NC} ${color}${count}${NC}"
     fi
-    if [ "$skipped_n" -gt 0 ]; then
-        status+=$(printf " · %d skip · next %dm" "$skipped_n" "$req_min")
-    fi
-    printf "  %b⏱  %s%b\n" "$main_color" "$status" "$NC"
+
+    printf "%s${WHITE}%s${NC}%s ${BOLD}>${NC} " "$scope_tag" "$time_str" "$count_part"
+}
+
+PROMPT_TICKER_PID=""
+
+# Background process that, every second while we're waiting for
+# input, redraws the prompt line in place. Uses cursor save/restore
+# so the user's typing is preserved (we only redraw the prefix; bash
+# read keeps the typed buffer painted to the right of the prefix).
+start_prompt_ticker() {
+    [ -n "$PROMPT_TICKER_PID" ] && return 0
+    [ -t 0 ] || return 0
+    [ -t 1 ] || return 0
+    (
+        while :; do
+            sleep 1
+            # Save cursor, go to col 0, redraw prompt prefix, restore.
+            # The user's in-progress input lives to the right of the
+            # prefix and is preserved because we don't clear past the
+            # prefix length. Width of the prefix stays constant during
+            # one cycle so input cells aren't overwritten.
+            local p; p=$(fmt_live_prompt)
+            printf "\033[s\r%b\033[u" "$p" >/dev/tty 2>/dev/null || break
+        done
+    ) &
+    PROMPT_TICKER_PID=$!
+    disown "$PROMPT_TICKER_PID" 2>/dev/null || true
+}
+
+stop_prompt_ticker() {
+    [ -n "$PROMPT_TICKER_PID" ] && kill "$PROMPT_TICKER_PID" 2>/dev/null
+    PROMPT_TICKER_PID=""
 }
 
 # Detailed break/cycle snapshot for the `status` command.
@@ -3166,11 +3253,13 @@ while true; do
         continue
     fi
 
-    print_break_status_line
-    if ! IFS= read -r -p "$(fmt_main_prompt)" input; then
+    start_prompt_ticker
+    if ! IFS= read -r -p "$(fmt_live_prompt)" input; then
+        stop_prompt_ticker
         echo
         break
     fi
+    stop_prompt_ticker
 
     input=$(trim_ws "$input")
     cmd="${input%% *}"
