@@ -1635,7 +1635,7 @@ show_calendar() {
     fi
 
     echo
-    printf "  ${BOLD}%*s${NC}\n" 22 "$month_name"
+    printf "  ${BOLD}%*s${NC}\n" 20 "$month_name"
     echo -e "  ${MAGENTA}Mo Tu We Th Fr Sa Su${NC}"
 
     printf "  "
@@ -2411,6 +2411,7 @@ fi
 touch_timestamp
 start_break_watcher
 show_welcome
+show_calendar
 
 while true; do
     if [ -f "$ALERT_FILE" ]; then
