@@ -959,6 +959,7 @@ list_scope() {
     print_listing_rule
 
     local cur="" total=0 count=0 hours_total="0"
+    local gid file line date time_range task duration description type hours
     while IFS='|' read -r gid file line date time_range task duration description type hours; do
         if [ "$date" != "$cur" ]; then
             printf "  ${DIM}%s${NC}\n" "$date"
@@ -1026,6 +1027,7 @@ show_stats() {
     local billed_count=0 billed_worked_minutes=0
     local billed_hours_total="0"
 
+    local gid file line date time_range task duration description type hours
     while IFS='|' read -r gid file line date time_range task duration description type hours; do
         m=$(duration_to_minutes "$duration")
         printf "%06d|%s|%s|%s|%s|%s|%s|%s\n" "$m" "$date" "$time_range" "$task" "$duration" "$description" "$type" "$hours" >> "$sort_file"
@@ -1237,6 +1239,7 @@ search_tasks() {
     print_listing_header
     print_listing_rule
     local total=0 count=0 cur="" hours_total="0" billed_minutes=0 billed_count=0
+    local gid file line date time_range task duration description type hours
     while IFS='|' read -r gid file line date time_range task duration description type hours; do
         if [ "$date" != "$cur" ]; then
             printf "  ${DIM}%s${NC}\n" "$date"
@@ -1485,7 +1488,7 @@ show_edit_help() {
     echo -e "    ${WHITE}end${NC}                   change end time"
     echo -e "    ${WHITE}bill${NC}                  set billed hours"
     echo
-    echo -e "  ${DIM}standalone shortcuts:${NC} ${WHITE}title${NC}${DIM},${NC} ${WHITE}desc${NC}${DIM},${NC} ${WHITE}type${NC}${DIM},${NC} ${WHITE}bill${NC} ${DIM}(each takes optional id)${NC}"
+    echo -e "  ${DIM}standalone shortcuts:${NC} ${WHITE}title${NC}${DIM},${NC} ${WHITE}desc${NC}${DIM},${NC} ${WHITE}type${NC}${DIM},${NC} ${WHITE}start${NC}${DIM},${NC} ${WHITE}end${NC}${DIM},${NC} ${WHITE}bill${NC} ${DIM}(each takes optional id)${NC}"
     echo
 }
 
@@ -1902,26 +1905,38 @@ handle_break_flow() {
 # ============================================================
 #  New task logging
 # ============================================================
-# Read the description prompt as a mini-CLI. The caller provides
-# the in-progress $type / $tc / $description via local variables;
-# this function loops, accepting:
-#   - single-word unique type prefix  -> change $type (and $tc), loop
-#   - q / quit / exit / abort / cancel -> abort task, return 1
-#   - anything else                    -> set $description, return 0
+# Read the description as a mini-CLI mirroring the main prompt.
+# Caller supplies $type / $tc / $description as local variables.
+# Per-iteration precedence:
+#   1. empty input              -> blank description, return 0
+#   2. q/quit/exit/abort/cancel -> abort the task, return 1
+#   3. single-word type prefix  -> change $type (and $tc), loop
+#   4. recognized command       -> dispatch, loop (back to desc)
+#   5. anything else            -> set $description, return 0
 prompt_description_for_task() {
     while :; do
         local raw
-        read -r -p "$(echo -ne "${tc}[${type}]${NC} ${BOLD}>${NC} ")" raw
+        read -r -p "$(printf '%s[%s]%s %s>%s ' "$tc" "$type" "$NC" "$BOLD" "$NC")" raw
         local trimmed; trimmed=$(trim_ws "$raw")
 
-        if [ -n "$trimmed" ] && [[ "$trimmed" != *" "* ]]; then
-            case "${trimmed,,}" in
-                q|quit|exit|abort|cancel)
-                    echo -e "  ${YELLOW}● cancelled${NC}"
-                    return 1
-                    ;;
-            esac
-            local m; m=$(match_type_prefix "${trimmed,,}"); local rc=$?
+        if [ -z "$trimmed" ]; then
+            description=""
+            return 0
+        fi
+
+        local d_cmd="${trimmed%% *}"
+        local d_args="${trimmed#"$d_cmd"}"; d_args="${d_args# }"
+
+        case "${d_cmd,,}" in
+            q|quit|exit|abort|cancel)
+                echo -e "  ${YELLOW}● cancelled${NC}"
+                return 1
+                ;;
+        esac
+
+        # Single-word type prefix -> change in-progress type.
+        if [[ "$trimmed" != *" "* ]]; then
+            local m; m=$(match_type_prefix "${d_cmd,,}"); local rc=$?
             if [ "$rc" -eq 0 ] && [ -n "$m" ] && [ "$m" != "$type" ]; then
                 type="$m"
                 tc=$(type_color "$type")
@@ -1929,6 +1944,12 @@ prompt_description_for_task() {
             fi
         fi
 
+        # Try as a regular command (ls / stats / edit / scope / ...).
+        if dispatch_command "$d_cmd" "$d_args"; then
+            continue
+        fi
+
+        # Otherwise treat as the description.
         description="$trimmed"
         return 0
     done
@@ -2225,6 +2246,7 @@ export_scope_to_ics() {
     } > "$out"
 
     local f
+    local d tr title dur desc type hours
     for f in "${SCOPE_FILES[@]}"; do
         [ -f "$f" ] || continue
         while IFS='|' read -r d tr title dur desc type hours; do
@@ -2343,6 +2365,80 @@ resolve_subverb() {
         if [ "$k" = "$lc" ]; then echo "$v"; return 0; fi
     done
     return 1
+}
+
+# Run one top-level command. Returns 0 if $cmd was recognized
+# (and the command was executed), 1 otherwise. Used by both the
+# main loop and the description prompt mini-CLI.
+# 'quit' / 'exit' / 'q' are NOT handled here - the meaning of
+# those depends on context (exit program vs. abort task).
+dispatch_command() {
+    local cmd="$1" args="$2"
+    case "$cmd" in
+        stats|stat)        show_stats; echo ;;
+        ls|list|last)      show_last "$args"; echo ;;
+        all)               list_scope; echo ;;
+        rm|del)            delete_task "$args"; echo ;;
+        edit)              handle_edit_cmd "$args"; echo ;;
+        title)             edit_field_cmd title "$args"; echo ;;
+        desc|description)  edit_field_cmd desc  "$args"; echo ;;
+        type)              edit_field_cmd type  "$args"; echo ;;
+        start)             edit_field_cmd start "$args"; echo ;;
+        end)               edit_field_cmd end   "$args"; echo ;;
+        bill|billed|hours) edit_field_cmd bill  "$args"; echo ;;
+        resume)            resume_task "$args"; echo ;;
+        grep|search)       search_tasks "$args"; echo ;;
+        export)            export_scope_to_ics; echo ;;
+        cal|calendar)      show_calendar "$args"; echo ;;
+        profile|config)    manage_profile "$args"; echo ;;
+        today)
+            scope_set_today
+            echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
+            echo ;;
+        yesterday)
+            if shift_active_date -1; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
+            fi
+            echo ;;
+        tomorrow)
+            if shift_active_date +1; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
+            fi
+            echo ;;
+        goto)
+            if [ -z "$args" ]; then
+                echo -e "${RED}usage: goto YYYY-MM-DD${NC}"
+            elif scope_set_date "$args"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
+            fi
+            echo ;;
+        month)
+            if scope_set_month "$args"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
+            fi
+            echo ;;
+        year)
+            if scope_set_year "$args"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
+            fi
+            echo ;;
+        range)
+            local s e
+            read -r s e _ <<< "$args"
+            if [ -z "$s" ] || [ -z "$e" ]; then
+                echo -e "${RED}usage: range YYYY-MM-DD YYYY-MM-DD${NC}"
+            elif scope_set_range "$s" "$e"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
+            fi
+            echo ;;
+        scope)             handle_scope_cmd "$args"; echo ;;
+        status)            show_break_status ;;
+        migrate)           migrate_legacy; echo ;;
+        clear)             clear ;;
+        help|"?")          show_help_dispatch "$args" ;;
+        *)                 return 1 ;;
+    esac
+    return 0
 }
 
 handle_scope_cmd() {
@@ -2537,7 +2633,7 @@ show_help() {
     echo
     print_help_row "LOGGING" "$GREEN"   "<title>" "<type> <title>" "resume"
     print_help_row "VIEW"    "$CYAN"    "all" "ls" "stats" "grep"
-    print_help_row "EDIT"    "$YELLOW"  "edit" "title" "desc" "type" "bill" "rm"
+    print_help_row "EDIT"    "$YELLOW"  "edit" "title" "desc" "type" "start" "end" "bill" "rm"
     print_help_row "SCOPE"   "$MAGENTA" "today" "yesterday" "tomorrow" "goto" "month" "year" "range" "cal" "scope"
     print_help_row "TOOLS"   "$BLUE"    "status" "export" "profile" "migrate" "clear" "help" "quit"
     echo
@@ -2590,7 +2686,7 @@ show_help_command() {
             echo -e "    ${WHITE}edit <id>${NC}                  full walkthrough on a task"
             echo -e "    ${WHITE}edit <field> [id]${NC}          edit one field (title, desc, type, start, end, bill)"
             echo -e "    ${WHITE}edit help${NC}                  list editable fields"
-            echo -e "    ${DIM}standalone shortcuts:${NC} ${WHITE}title${NC}${DIM},${NC} ${WHITE}desc${NC}${DIM},${NC} ${WHITE}type${NC}${DIM},${NC} ${WHITE}bill${NC}"
+            echo -e "    ${DIM}standalone shortcuts:${NC} ${WHITE}title${NC}${DIM},${NC} ${WHITE}desc${NC}${DIM},${NC} ${WHITE}type${NC}${DIM},${NC} ${WHITE}start${NC}${DIM},${NC} ${WHITE}end${NC}${DIM},${NC} ${WHITE}bill${NC}"
             ;;
         title)
             echo -e "  ${BOLD}title${NC} [id]                   edit the title of a task"
@@ -2603,6 +2699,14 @@ show_help_command() {
         type)
             echo -e "  ${BOLD}type${NC} [id]                    change the type of a task"
             echo -e "    ${DIM}no id -> last task touched; runs the type picker${NC}"
+            ;;
+        start)
+            echo -e "  ${BOLD}start${NC} [id]                   change the start time of a task"
+            echo -e "    ${DIM}no id -> last task touched${NC}"
+            ;;
+        end)
+            echo -e "  ${BOLD}end${NC} [id]                     change the end time of a task"
+            echo -e "    ${DIM}no id -> last task touched${NC}"
             ;;
         bill)
             echo -e "  ${BOLD}bill${NC} [id]                    set billing on a task"
@@ -2753,7 +2857,7 @@ show_help_category() {
             cmds=("all" "ls" "stats" "grep") ;;
         editing|edits)
             label="EDIT"; color="$YELLOW"
-            cmds=("edit" "title" "desc" "type" "bill" "rm") ;;
+            cmds=("edit" "title" "desc" "type" "start" "end" "bill" "rm") ;;
         scoping|scopes)
             label="SCOPE"; color="$MAGENTA"
             cmds=("today" "yesterday" "tomorrow" "goto" "month" "year" "range" "cal" "scope") ;;
@@ -2831,6 +2935,8 @@ show_full_help() {
     echo -e "    ${WHITE}title${NC} [id]               shortcut: edit title"
     echo -e "    ${WHITE}desc${NC}  [id]               shortcut: edit description"
     echo -e "    ${WHITE}type${NC}  [id]               shortcut: edit type"
+    echo -e "    ${WHITE}start${NC} [id]               shortcut: edit start time"
+    echo -e "    ${WHITE}end${NC}   [id]               shortcut: edit end time"
     echo -e "    ${WHITE}bill${NC}  [id]               shortcut: set billed hours"
     echo -e "    ${WHITE}rm${NC}    [id]               remove entry (last if id omitted)"
     echo
@@ -3124,88 +3230,14 @@ while true; do
     case "$cmd" in
         "" )
             touch_timestamp; continue ;;
-        stats|stat )
-            show_stats; echo ;;
-        ls|list|last )
-            show_last "$args"; echo ;;
-        all )
-            list_scope; echo ;;
-        rm|del )
-            delete_task "$args"; echo ;;
-        edit )
-            handle_edit_cmd "$args"; echo ;;
-        title )
-            edit_field_cmd title "$args"; echo ;;
-        desc )
-            edit_field_cmd desc  "$args"; echo ;;
-        type )
-            edit_field_cmd type  "$args"; echo ;;
-        bill )
-            edit_field_cmd bill  "$args"; echo ;;
-        resume )
-            resume_task "$args"; echo ;;
-        grep|search )
-            search_tasks "$args"; echo ;;
-        export )
-            export_scope_to_ics; echo ;;
-        cal|calendar )
-            show_calendar "$args"; echo ;;
-        profile|config )
-            manage_profile "$args"; echo ;;
-        today )
-            scope_set_today
-            echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
-            echo ;;
-        yesterday )
-            if shift_active_date -1; then
-                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
-            fi
-            echo ;;
-        tomorrow )
-            if shift_active_date +1; then
-                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
-            fi
-            echo ;;
-        goto )
-            if [ -z "$args" ]; then
-                echo -e "${RED}usage: goto YYYY-MM-DD${NC}"
-            elif scope_set_date "$args"; then
-                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
-            fi
-            echo ;;
-        month )
-            if scope_set_month "$args"; then
-                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
-            fi
-            echo ;;
-        year )
-            if scope_set_year "$args"; then
-                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
-            fi
-            echo ;;
-        range )
-            read -r s e _ <<< "$args"
-            if [ -z "$s" ] || [ -z "$e" ]; then
-                echo -e "${RED}usage: range YYYY-MM-DD YYYY-MM-DD${NC}"
-            elif scope_set_range "$s" "$e"; then
-                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
-            fi
-            echo ;;
-        scope )
-            handle_scope_cmd "$args"; echo ;;
-        status )
-            show_break_status ;;
-        migrate )
-            migrate_legacy; echo ;;
-        clear )
-            clear ;;
-        help|"?" )
-            show_help_dispatch "$args" ;;
         quit|exit|q )
             break ;;
         * )
-            log_new_task "$input"
-            echo ;;
+            if ! dispatch_command "$cmd" "$args"; then
+                log_new_task "$input"
+                echo
+            fi
+            ;;
     esac
     touch_timestamp
 done
