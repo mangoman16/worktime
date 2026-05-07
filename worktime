@@ -2328,32 +2328,18 @@ breaks_status_color() {
     fi
 }
 
-# Resolve a sub-verb against a CSV list of "alias=canonical" pairs.
-# Echoes the canonical name on success, AMBIG:... when multiple.
-# Args: $1 = input, $2... = list of alias=canonical pairs
+# Resolve a sub-verb by exact match against a CSV list of
+# "alias=canonical" pairs. No prefix matching - typing the full
+# verb (or one of the explicit aliases) is required.
 resolve_subverb() {
     local lc="${1,,}"; shift
     [ -z "$lc" ] && return 1
-    local -A table=()
     local pair k v
     for pair in "$@"; do
         k="${pair%%=*}"; v="${pair#*=}"
-        table[$k]="$v"
+        if [ "$k" = "$lc" ]; then echo "$v"; return 0; fi
     done
-    if [ -n "${table[$lc]:-}" ]; then echo "${table[$lc]}"; return 0; fi
-    local -A seen=()
-    local matches=() canon
-    for k in "${!table[@]}"; do
-        if [[ "$k" == "$lc"* ]]; then
-            canon="${table[$k]}"
-            [ -z "${seen[$canon]:-}" ] && { matches+=("$canon"); seen[$canon]=1; }
-        fi
-    done
-    case "${#matches[@]}" in
-        0) return 1 ;;
-        1) echo "${matches[0]}"; return 0 ;;
-        *) local j; j=$(IFS=,; echo "${matches[*]}"); echo "AMBIG:$j"; return 2 ;;
-    esac
+    return 1
 }
 
 handle_scope_cmd() {
@@ -2523,7 +2509,7 @@ help_hint() {
     echo -e "  ${BOLD}drill in${NC}"
     echo -e "    ${WHITE}help <category>${NC}   ${GREEN}logging${NC}${DIM},${NC} ${CYAN}view${NC}${DIM},${NC} ${YELLOW}editing${NC}${DIM},${NC} ${MAGENTA}scoping${NC}${DIM},${NC} ${BLUE}tools${NC}"
     echo -e "    ${WHITE}help <command>${NC}    ${DIM}any command listed above   (e.g.${NC} ${WHITE}help edit${NC}${DIM})${NC}"
-    echo -e "    ${WHITE}help <topic>${NC}      ${WHITE}types${NC}${DIM},${NC} ${WHITE}billing${NC}${DIM},${NC} ${WHITE}breaks${NC}${DIM},${NC} ${WHITE}flags${NC}${DIM},${NC} ${WHITE}abbrev${NC}"
+    echo -e "    ${WHITE}help <topic>${NC}      ${WHITE}types${NC}${DIM},${NC} ${WHITE}billing${NC}${DIM},${NC} ${WHITE}breaks${NC}${DIM},${NC} ${WHITE}flags${NC}"
     echo -e "    ${WHITE}help full${NC}         ${DIM}everything on one screen${NC}"
 }
 
@@ -2637,7 +2623,7 @@ show_help_command() {
         cal|calendar) echo -e "  ${BOLD}cal${NC}   [YYYY-MM]              calendar grid with activity markers" ;;
         scope)
             echo -e "  ${BOLD}scope${NC}                        print current scope info and files"
-            echo -e "    ${WHITE}scope <verb> [args]${NC}         nested form (any unique prefix works)"
+            echo -e "    ${WHITE}scope <verb> [args]${NC}         nested form"
             echo -e "      ${WHITE}show${NC}                       same as bare 'scope'"
             echo -e "      ${WHITE}today${NC}                      reset to today"
             echo -e "      ${WHITE}yesterday${NC} | ${WHITE}tomorrow${NC}      shift the active date"
@@ -2661,7 +2647,6 @@ show_help_command() {
             echo -e "    ${WHITE}profile show${NC}               same as bare 'profile'"
             echo -e "    ${WHITE}profile edit${NC}               walk through profile fields"
             echo -e "    ${WHITE}profile open${NC}               open the profile file in \$EDITOR"
-            echo -e "    ${DIM}sub-verbs accept any unique prefix (p s, p e, p o).${NC}"
             ;;
         migrate)
             echo -e "  ${BOLD}migrate${NC}                      move legacy logs into the year/month tree"
@@ -2740,25 +2725,6 @@ show_help_topic() {
             echo -e "             ${DIM}the body next to that interval.${NC}"
             echo
             echo -e "    a ${WHITE}$((BREAK_GAP_RESET/60))+ min${NC} idle gap or a logged break resets the cycle."
-            return 0 ;;
-        abbrev|abbreviation|prefixes|shortcuts)
-            echo -e "  ${BOLD}ABBREVIATION${NC}  ${DIM}(Cisco-IOS-style: any unique prefix matches)${NC}"
-            echo -e "  ${DIM}single-char input does NOT prefix-match (so 'b' still logs a break task).${NC}"
-            echo
-            local _seen=() _canon _printed _list
-            local _all=(stats ls all rm edit title desc type bill resume grep export cal profile today yesterday tomorrow goto month year range scope status migrate clear help quit)
-            for _canon in "${_all[@]}"; do
-                local _mp; _mp=$(min_unique_command_prefix "$_canon")
-                if [ "$_mp" = "$_canon" ]; then
-                    printf "    ${WHITE}%-12s${NC}  ${DIM}no shorter unique prefix${NC}\n" "$_canon"
-                else
-                    printf "    ${WHITE}%-12s${NC}  ${DIM}-> ${NC}${WHITE}%s${NC}${DIM}…${NC}\n" "$_canon" "$_mp"
-                fi
-            done
-            echo
-            echo -e "  ${DIM}aliases:${NC} ${WHITE}stat${NC}=stats ${WHITE}list/last${NC}=ls ${WHITE}del${NC}=rm ${WHITE}description${NC}=desc"
-            echo -e "           ${WHITE}billed/hours${NC}=bill ${WHITE}search${NC}=grep ${WHITE}calendar${NC}=cal"
-            echo -e "           ${WHITE}config${NC}=profile ${WHITE}?${NC}=help ${WHITE}exit/q${NC}=quit"
             return 0 ;;
         flags|cli|startup)
             echo -e "  ${BOLD}STARTUP FLAGS${NC}"
@@ -3140,111 +3106,6 @@ start_break_watcher
 show_calendar "" minimal
 show_welcome
 
-# ============================================================
-#  Command resolution (Cisco-IOS-style abbreviation)
-# ============================================================
-# Every entry maps a typed name (canonical or alias) to its
-# canonical command. Resolution: exact match wins; then a prefix
-# match against keys, deduplicated to canonical names. Single-char
-# input does not prefix-match (so 'b' still logs a break task).
-declare -A CMD_TABLE=(
-    [stats]=stats     [stat]=stats
-    [ls]=ls           [list]=ls         [last]=ls
-    [all]=all
-    [rm]=rm           [del]=rm
-    [edit]=edit
-    [title]=title
-    [desc]=desc       [description]=desc
-    [type]=type
-    [bill]=bill       [billed]=bill     [hours]=bill
-    [resume]=resume
-    [grep]=grep       [search]=grep
-    [export]=export
-    [cal]=cal         [calendar]=cal
-    [profile]=profile [config]=profile
-    [today]=today
-    [yesterday]=yesterday
-    [tomorrow]=tomorrow
-    [goto]=goto
-    [month]=month
-    [year]=year
-    [range]=range
-    [scope]=scope
-    [status]=status
-    [migrate]=migrate
-    [clear]=clear
-    [help]=help       [?]=help
-    [quit]=quit       [exit]=quit       [q]=quit
-)
-
-# Resolve user input to a canonical command, given the FULL input
-# line (so we can fall through to the type-prefix-with-rest case).
-# Echoes the canonical name on success, "AMBIG:c1,c2,..." when
-# multiple, nothing on no match.
-# Return: 0 ok, 1 not a command, 2 ambiguous.
-resolve_command() {
-    local input="$1"
-    local first="${input%% *}"
-    local lc="${first,,}"
-    local has_rest="no"
-    [[ "$input" == *" "* ]] && has_rest="yes"
-
-    [ -z "$lc" ] && return 1
-
-    # Exact match (canonical or alias).
-    if [ -n "${CMD_TABLE[$lc]:-}" ]; then
-        echo "${CMD_TABLE[$lc]}"; return 0
-    fi
-
-    # If there's a title following the first word and the first
-    # word is also a unique type prefix, prefer logging the task
-    # (so 'ti #12345', 'ca foo', 'mo check' keep working).
-    if [ "$has_rest" = "yes" ]; then
-        local m; m=$(match_type_prefix "$lc"); local rc=$?
-        case $rc in 0|2) return 1 ;; esac
-    fi
-
-    # Single-char input never prefix-matches commands.
-    [ "${#lc}" -lt 2 ] && return 1
-
-    local -A canon_seen=()
-    local matches=() k canon
-    for k in "${!CMD_TABLE[@]}"; do
-        if [[ "$k" == "$lc"* ]]; then
-            canon="${CMD_TABLE[$k]}"
-            if [ -z "${canon_seen[$canon]:-}" ]; then
-                matches+=("$canon")
-                canon_seen[$canon]=1
-            fi
-        fi
-    done
-    case "${#matches[@]}" in
-        0) return 1 ;;
-        1) echo "${matches[0]}"; return 0 ;;
-        *)
-            local joined; joined=$(IFS=,; echo "${matches[*]}")
-            echo "AMBIG:$joined"; return 2 ;;
-    esac
-}
-
-# Shortest unique prefix for a canonical command, computed against
-# the current CMD_TABLE. Used by 'help abbrev'.
-min_unique_command_prefix() {
-    local target="$1"
-    local len=1 cand other ok
-    while [ "$len" -le "${#target}" ]; do
-        cand="${target:0:$len}"
-        ok=1
-        for other in "${!CMD_TABLE[@]}"; do
-            [ "${CMD_TABLE[$other]}" = "$target" ] && continue
-            if [[ "$other" == "$cand"* ]]; then ok=0; break; fi
-        done
-        if [ "$ok" -eq 1 ]; then echo "$cand"; return; fi
-        len=$((len+1))
-    done
-    echo "$target"
-}
-
 while true; do
     break_check_gap_reset
     if [ -f "$ALERT_FILE" ]; then
@@ -3265,20 +3126,6 @@ while true; do
     cmd="${input%% *}"
     args="${input#"$cmd"}"
     args="${args# }"
-
-    # Resolve typed prefix/alias to a canonical command.
-    if [ -n "$cmd" ]; then
-        resolved=$(resolve_command "$input"); rc=$?
-        case $rc in
-            0) cmd="$resolved" ;;
-            2)
-                echo -e "  ${YELLOW}'${cmd}' is ambiguous: ${resolved#AMBIG:}${NC}"
-                echo
-                touch_timestamp
-                continue
-                ;;
-        esac
-    fi
 
     case "$cmd" in
         "" )
