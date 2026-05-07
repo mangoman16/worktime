@@ -75,6 +75,7 @@ CYAN='\033[1;36m'
 MAGENTA='\033[1;35m'
 WHITE='\033[1;37m'
 GRAY='\033[0;37m'
+TEAL='\033[0;36m'
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
@@ -91,17 +92,15 @@ COL_DUR=10
 COL_BILL=18
 
 # ---------- Known task types ----------
-TASK_TYPES=("task" "ticket" "project" "order" "appointment" "monitoring" "break")
+TASK_TYPES=("task" "ticket" "project" "order" "appointment" "monitoring" "call" "break")
 
-# Default 2-letter shortcut shown in menus
-declare -A DEFAULT_SHORTCUT=(
-    ["task"]="ta"
-    ["ticket"]="ti"
-    ["project"]="pr"
-    ["order"]="or"
-    ["appointment"]="ap"
-    ["monitoring"]="mo"
-    ["break"]="br"
+# Aliases that resolve to a canonical type. Both keys and canonical
+# names are matched as prefixes by match_type_prefix, so 'tel', 'tele',
+# 'telef...', 'teleph...' all reduce to 'call'. Keep these lower-case.
+declare -A TYPE_ALIASES=(
+    ["telephone"]="call"
+    ["telefon"]="call"
+    ["tel"]="call"
 )
 
 is_known_type() {
@@ -138,10 +137,20 @@ min_unique_prefix() {
 match_type_prefix() {
     local pfx="${1,,}"
     [ -z "$pfx" ] && { echo ""; return 1; }
-    local matches=() t
+    local -a matches=()
+    declare -A seen=()
+    local t k canon
     for t in "${TASK_TYPES[@]}"; do
         if [[ "$t" == "$pfx"* ]]; then
-            matches+=("$t")
+            matches+=("$t"); seen[$t]=1
+        fi
+    done
+    for k in "${!TYPE_ALIASES[@]}"; do
+        if [[ "$k" == "$pfx"* ]]; then
+            canon="${TYPE_ALIASES[$k]}"
+            if [ -z "${seen[$canon]:-}" ]; then
+                matches+=("$canon"); seen[$canon]=1
+            fi
         fi
     done
     case "${#matches[@]}" in
@@ -614,9 +623,21 @@ sanitize_pipe() {
     fi
 }
 
+# Trim leading and trailing whitespace (spaces, tabs).
+trim_ws() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf "%s" "$s"
+}
+
 validate_hours() {
     local h="$1"
     [ -z "$h" ] && { echo "0.00"; return 0; }
+    # Accept SLA marker as a special value (case-insensitive).
+    if [[ "${h^^}" =~ ^[[:space:]]*SLA[[:space:]]*$ ]]; then
+        echo "SLA"; return 0
+    fi
     h="${h//,/.}"
     h="${h//[[:space:]]/}"
     h="${h//h/}"
@@ -627,9 +648,14 @@ validate_hours() {
     return 1
 }
 
+hours_is_sla() {
+    [ "${1^^}" = "SLA" ]
+}
+
 format_hours() {
     local h="$1"
     [ -z "$h" ] && return
+    if hours_is_sla "$h"; then echo "SLA"; return; fi
     [ "$(awk -v h="$h" 'BEGIN{print (h+0 == 0)}')" = "1" ] && return
     local m; m=$(awk -v h="$h" 'BEGIN{printf "%d", h*60+0.5}')
     local hh=$((m / 60)) mm=$((m % 60))
@@ -642,12 +668,14 @@ format_hours() {
 hours_is_billed() {
     local h="$1"
     [ -z "$h" ] && return 1
+    hours_is_sla "$h" && return 1
     [ "$(awk -v h="$h" 'BEGIN{print (h+0 > 0)}')" = "1" ]
 }
 
 format_eur_for_hours() {
     local h="$1"
     [ -z "$h" ] && return
+    hours_is_sla "$h" && return
     local eur; eur=$(awk -v h="$h" -v r="$HOURLY_RATE" 'BEGIN{printf "%.2f", h*r}')
     [ "$(awk -v e="$eur" 'BEGIN{print (e+0 == 0)}')" = "1" ] && return
     printf "€%s" "$eur"
@@ -663,7 +691,7 @@ format_eur_for_hours() {
 #    T_AMBIGUOUS_LIST    - csv of candidate types (when ambiguous)
 # ============================================================
 parse_task_title() {
-    local input="$1"
+    local input; input=$(trim_ws "$1")
     T_AMBIGUOUS_LIST=""
     local first_word="${input%% *}"
     local has_rest="no"
@@ -699,12 +727,17 @@ parse_task_title() {
             ;;
     esac
 
-    # 2. Pattern detection - ticket / order
+    # 2. Pattern detection - ticket / order / appointment
     if [[ "$input" =~ (^|[[:space:]])#[0-9]{5,}([^0-9]|$) ]]; then
         T_TYPE="ticket"; T_TITLE="$input"; T_TYPE_RESOLVED="yes"; return
     fi
     if [[ "$input" =~ (^|[[:space:]])[0-9]{8,}([^0-9]|$) ]]; then
         T_TYPE="order";  T_TITLE="$input"; T_TYPE_RESOLVED="yes"; return
+    fi
+    # 'termin' (German) or 'appointment' anywhere in the title.
+    local _lc="${input,,}"
+    if [[ "$_lc" =~ (^|[^[:alnum:]])(termin|appointment)([^[:alnum:]]|$) ]]; then
+        T_TYPE="appointment"; T_TITLE="$input"; T_TYPE_RESOLVED="yes"; return
     fi
 
     # 3. Default
@@ -794,6 +827,7 @@ type_color() {
         order)       echo -e "${GREEN}" ;;
         appointment) echo -e "${BLUE}" ;;
         monitoring)  echo -e "${RED}" ;;
+        call)        echo -e "${TEAL}" ;;
         break)       echo -e "${GRAY}" ;;
         task|*)      echo -e "${CYAN}" ;;
     esac
@@ -857,11 +891,15 @@ print_task_row() {
     local bill_text="" bill_color="$DIM"
     local hd; hd=$(format_hours "$hours")
     if [ -n "$hd" ]; then
-        local eur; eur=$(format_eur_for_hours "$hours")
-        if [ -n "$eur" ]; then
-            bill_text="$hd $eur"; bill_color="$GREEN"
+        if hours_is_sla "$hours"; then
+            bill_text="$hd"; bill_color="$BLUE"
         else
-            bill_text="$hd"
+            local eur; eur=$(format_eur_for_hours "$hours")
+            if [ -n "$eur" ]; then
+                bill_text="$hd $eur"; bill_color="$GREEN"
+            else
+                bill_text="$hd"
+            fi
         fi
     else
         bill_text="-"
@@ -980,6 +1018,7 @@ show_stats() {
     local total=0 count=0 mn=999999 mx=0 m
     declare -A type_count type_minutes
     local free_count=0 free_minutes=0
+    local sla_count=0 sla_minutes=0
     local billed_count=0 billed_worked_minutes=0
     local billed_hours_total="0"
 
@@ -995,7 +1034,10 @@ show_stats() {
         type_count[$tk]=$(( ${type_count[$tk]:-0} + 1 ))
         type_minutes[$tk]=$(( ${type_minutes[$tk]:-0} + m ))
 
-        if hours_is_billed "$hours"; then
+        if hours_is_sla "$hours"; then
+            sla_count=$((sla_count + 1))
+            sla_minutes=$((sla_minutes + m))
+        elif hours_is_billed "$hours"; then
             billed_count=$((billed_count + 1))
             billed_worked_minutes=$((billed_worked_minutes + m))
             billed_hours_total=$(awk -v a="$billed_hours_total" -v b="$hours" 'BEGIN{printf "%.2f", a+b}')
@@ -1062,7 +1104,7 @@ show_stats() {
     fi
 
     # ---- Billing ---------------------------------------------
-    if [ "$free_count" -gt 0 ] || [ "$billed_count" -gt 0 ]; then
+    if [ "$free_count" -gt 0 ] || [ "$billed_count" -gt 0 ] || [ "$sla_count" -gt 0 ]; then
         echo
         echo -e "  ${BOLD}billing${NC}"
         printf "  ${DIM}%-10s  %5s  %10s  %12s${NC}\n" "kind" "count" "worked" "billed"
@@ -1073,6 +1115,10 @@ show_stats() {
         if [ "$free_count" -gt 0 ]; then
             printf "  %-10s  ${WHITE}%5d${NC}  %10s  %12s\n" \
                 "free" "$free_count" "$(format_minutes "$free_minutes")" "-"
+        fi
+        if [ "$sla_count" -gt 0 ]; then
+            printf "  ${BLUE}%-10s  %5d  %10s  %12s${NC}\n" \
+                "sla" "$sla_count" "$(format_minutes "$sla_minutes")" "SLA"
         fi
         if [ "$billed_count" -gt 0 ]; then
             local eur; eur=$(format_eur_for_hours "$billed_hours_total")
@@ -1311,7 +1357,7 @@ edit_task_full() {
     local new_title
     read -r -p "$(echo -ne "${DIM}title${NC} ${WHITE}[${I_TITLE}]${NC} > ")" new_title
     new_title=${new_title:-$I_TITLE}
-    new_title=$(sanitize_pipe "$new_title")
+    new_title=$(trim_ws "$(sanitize_pipe "$new_title")")
 
     local new_start; new_start=$(read_time "start" "$old_start")
     local new_end;   new_end=$(read_time "end"   "$old_end")
@@ -1322,7 +1368,7 @@ edit_task_full() {
     local new_description
     read -r -p "$(echo -ne "${DIM}desc${NC} ${WHITE}[${I_DESC}]${NC} > ")" new_description
     new_description=${new_description:-$I_DESC}
-    new_description=$(sanitize_pipe "$new_description")
+    new_description=$(trim_ws "$(sanitize_pipe "$new_description")")
 
     local raw_h new_hours
     read -r -p "$(echo -ne "${DIM}bill${NC} ${WHITE}[${old_hours}]${NC} > ")" raw_h
@@ -1370,7 +1416,7 @@ edit_task_field() {
         title)
             local in
             read -r -p "$(echo -ne "${DIM}title${NC} ${WHITE}[${cur_title}]${NC} > ")" in
-            [ -n "$in" ] && cur_title=$(sanitize_pipe "$in")
+            [ -n "$in" ] && cur_title=$(trim_ws "$(sanitize_pipe "$in")")
             ;;
         start)
             cur_start=$(read_time "start" "$cur_start")
@@ -1385,7 +1431,7 @@ edit_task_field() {
         desc)
             local in
             read -r -p "$(echo -ne "${DIM}desc${NC} ${WHITE}[${cur_desc}]${NC} > ")" in
-            [ -n "$in" ] && cur_desc=$(sanitize_pipe "$in")
+            [ -n "$in" ] && cur_desc=$(trim_ws "$(sanitize_pipe "$in")")
             ;;
         bill)
             local raw_h
@@ -1471,7 +1517,7 @@ handle_edit_cmd() {
         type)               field="type"  ;;
         start)              field="start" ;;
         end)                field="end"   ;;
-        bill|billed|hours)  field="bill"  ;;
+        bill|billed|hours|sla)  field="bill"  ;;
         *)
             echo -e "${YELLOW}unknown edit target '$first' — try 'edit help'${NC}"
             return ;;
@@ -1812,12 +1858,14 @@ handle_break_flow() {
         local b_dur; b_dur=$(calculate_duration "$break_start" "$break_end")
         ensure_log_path "$(today_date)" >/dev/null
         echo "$(today_date)|$break_start-$break_end|break|$b_dur||break|0.00" >> "$file"
-        echo -e "  ${MAGENTA}─ break${NC}    logged"
+        local _bc; _bc=$(type_color "break")
+        echo -e "  ${_bc}─ break${NC}    logged"
         print_listing_header
         print_listing_rule
         print_task_row "" "$break_start-$break_end" "break" "$b_dur" "" "break" "0.00"
     else
-        printf "  ${MAGENTA}─ break${NC}    ${DIM}%dm taken (not logged — LOG_BREAKS=no)${NC}\n" $((break_sec/60))
+        local _bc; _bc=$(type_color "break")
+        printf "  ${_bc}─ break${NC}    ${DIM}%dm taken (not logged — LOG_BREAKS=no)${NC}\n" $((break_sec/60))
     fi
 
     local end_ts_break=$((break_start_ts + break_sec))
@@ -1853,10 +1901,11 @@ handle_break_flow() {
 log_new_task() {
     local raw_input="$1"
     local resumed="${2:-}"
+    raw_input=$(trim_ws "$raw_input")
     raw_input=$(sanitize_pipe "$raw_input")
 
     parse_task_title "$raw_input"
-    local title="$T_TITLE"
+    local title; title=$(trim_ws "$T_TITLE")
 
     # Resolve type up-front so we can announce it before the
     # description prompt. Skip the menu when unambiguous.
@@ -1912,22 +1961,23 @@ log_new_task() {
         read -r -p "$(echo -ne "${CYAN}${plabel}${NC} > ")" description
     fi
 
+    description=$(trim_ws "$description")
     description=$(sanitize_pipe "$description")
 
     local duration; duration=$(calculate_duration "$start" "$end")
     local file; file=$(ensure_log_path "$target_date")
     echo "$target_date|$start-$end|$title|$duration|$description|$type|$hours" >> "$file"
 
-    echo -e "${GREEN}─ logged${NC}"
-    print_listing_header
-    print_listing_rule
-    print_task_row "" "$start-$end" "$title" "$duration" "$description" "$type" "$hours"
-    rm -f "$TEMP_FILE"
-
     LAST_TASK_FILE="$file"
     LAST_TASK_LINE=$(wc -l < "$file")
     LAST_FIELD="desc"
     refresh_last_id
+
+    echo -e "${GREEN}─ logged${NC}"
+    print_listing_header
+    print_listing_rule
+    print_task_row "$LAST_TASK_ID" "$start-$end" "$title" "$duration" "$description" "$type" "$hours"
+    rm -f "$TEMP_FILE"
 }
 
 # ============================================================
@@ -2422,8 +2472,10 @@ show_help_command() {
             echo -e "    ${DIM}no id -> last task touched; runs the type picker${NC}"
             ;;
         bill)
-            echo -e "  ${BOLD}bill${NC} [id]                    set billed hours on a task"
-            echo -e "    ${DIM}decimal hours: 1 = 1h, 0.5 = 30m, blank = free${NC}"
+            echo -e "  ${BOLD}bill${NC} [id]                    set billing on a task"
+            echo -e "    ${DIM}decimal hours: 1 = 1h, 0.5 = 30m${NC}"
+            echo -e "    ${WHITE}0${NC} or blank ${DIM}= free (no charge)${NC}"
+            echo -e "    ${WHITE}SLA${NC}        ${DIM}= covered by service-level agreement${NC}"
             ;;
         rm|del)
             echo -e "  ${BOLD}rm${NC} [id]                      remove an entry (last if id omitted)"
@@ -2493,8 +2545,10 @@ show_help_topic() {
             echo -e "    ${WHITE}t bug${NC}                ${DIM}->${NC} ${YELLOW}ambiguous${NC}, prompts ${DIM}(task / ticket)${NC}"
             echo
             echo -e "  ${BOLD}AUTO-DETECTION${NC}"
-            echo -e "    ${YELLOW}#NNNNN${NC}                  ${DIM}-> ticket  (# + 5+ digits)${NC}"
-            echo -e "    ${GREEN}NNNNNNNN${NC}                ${DIM}-> order   (8+ standalone digits)${NC}"
+            echo -e "    ${YELLOW}#NNNNN${NC}                  ${DIM}-> ticket   (# + 5+ digits)${NC}"
+            echo -e "    ${GREEN}NNNNNNNN${NC}                ${DIM}-> order    (8+ standalone digits)${NC}"
+            echo -e "    ${BLUE}termin${NC} / ${BLUE}appointment${NC}     ${DIM}-> appointment (word in the title)${NC}"
+            echo -e "    ${TEAL}tel${NC} / ${TEAL}telefon${NC} / ${TEAL}telephone${NC}  ${DIM}-> call${NC}"
             return 0 ;;
         billing|bill-topic)
             local rate_note=""
@@ -2502,8 +2556,11 @@ show_help_topic() {
                 rate_note=" ${DIM}(€${HOURLY_RATE}/h)${NC}"
             fi
             echo -e "  ${BOLD}BILLING${NC}${rate_note}"
-            echo -e "    enter decimal hours when prompted: 1 = 1h, 0.5 = 30m, blank = free"
-            echo -e "    EUR is computed from HOURLY_RATE in the profile"
+            echo -e "    three kinds of entries:"
+            echo -e "      ${WHITE}free${NC}    ${DIM}- 0 or blank hours${NC}"
+            echo -e "      ${BLUE}sla${NC}     ${DIM}- covered by service-level agreement (enter 'SLA')${NC}"
+            echo -e "      ${GREEN}billed${NC}  ${DIM}- decimal hours: 1 = 1h, 0.5 = 30m${NC}"
+            echo -e "    EUR is computed from HOURLY_RATE in the profile (billed only)"
             return 0 ;;
         breaks|break-topic)
             echo -e "  ${BOLD}BREAKS${NC}  ${DIM}(Austrian Bildschirmpause, BiAV-VO § 10/2)${NC}"
@@ -2663,8 +2720,10 @@ show_full_help() {
     done
     echo
     echo -e "  ${BOLD}DETECTION${NC}"
-    echo -e "    ${YELLOW}#NNNNN${NC}                  ${DIM}-> ticket  (# + 5+ digits)${NC}"
-    echo -e "    ${GREEN}NNNNNNNN${NC}                ${DIM}-> order   (8+ standalone digits)${NC}"
+    echo -e "    ${YELLOW}#NNNNN${NC}                  ${DIM}-> ticket   (# + 5+ digits)${NC}"
+    echo -e "    ${GREEN}NNNNNNNN${NC}                ${DIM}-> order    (8+ standalone digits)${NC}"
+    echo -e "    ${BLUE}termin${NC}/${BLUE}appointment${NC}       ${DIM}-> appointment (word in the title)${NC}"
+    echo -e "    ${TEAL}tel${NC}/${TEAL}telefon${NC}/${TEAL}telephone${NC}    ${DIM}-> call${NC}"
     echo
     echo -e "  ${BOLD}BILLING${NC}${rate_note}"
     echo -e "    enter decimal hours when prompted: 1 = 1h, 0.5 = 30m, blank = free"
@@ -2785,6 +2844,7 @@ while true; do
         break
     fi
 
+    input=$(trim_ws "$input")
     cmd="${input%% *}"
     args="${input#"$cmd"}"
     args="${args# }"
