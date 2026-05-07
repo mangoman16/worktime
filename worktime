@@ -693,16 +693,15 @@ parse_task_title() {
 #   - empty input -> $1 default
 prompt_type_selection() {
     local default="$1"
-    local i=1 t tc menu="" sc
+    local i=1 t tc menu=""
     declare -A type_idx
     for t in "${TASK_TYPES[@]}"; do
         type_idx[$i]="$t"
-        sc="${DEFAULT_SHORTCUT[$t]}"
         if [ "$t" = "$default" ]; then
             tc=$(type_color "$t")
-            menu+="  ${tc}${BOLD}${i})${t}${NC}${DIM}/${sc}${NC}"
+            menu+="  ${tc}${BOLD}${i})${t}${NC}"
         else
-            menu+="  ${DIM}${i})${t}/${sc}${NC}"
+            menu+="  ${DIM}${i})${t}${NC}"
         fi
         i=$((i+1))
     done
@@ -717,9 +716,13 @@ prompt_type_selection() {
     fi
     local m; m=$(match_type_prefix "$choice")
     local rc=$?
-    if [ $rc -eq 0 ]; then
-        P_SELECTED_TYPE="$m"; return
-    fi
+    case $rc in
+        0) P_SELECTED_TYPE="$m"; return ;;
+        2)
+            echo -e "${YELLOW}'${choice}' is ambiguous (${m#AMBIG:})${NC}"
+            P_SELECTED_TYPE="$default"
+            return ;;
+    esac
     if is_known_type "$choice"; then
         P_SELECTED_TYPE="$choice"; return
     fi
