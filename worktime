@@ -1919,22 +1919,25 @@ log_new_task() {
     fi
 
     # User typed only a type / type-prefix - ask for the title now.
+    # Breaks accept an empty title and use a default literal "break".
     if [ -z "$title" ]; then
-        local tc; tc=$(type_color "$type")
-        local raw_title
-        read -r -p "$(echo -ne "${tc}[${type}]${NC} ${DIM}title${NC} > ")" raw_title
-        title=$(sanitize_pipe "$raw_title")
-        if [ -z "$title" ]; then
-            echo -e "${YELLOW}cancelled — empty title${NC}"
-            return
+        if [ "$type" = "break" ]; then
+            title="break"
+        else
+            local tc; tc=$(type_color "$type")
+            local raw_title
+            read -r -p "$(echo -ne "${tc}[${type}]${NC} ${DIM}title${NC} > ")" raw_title
+            title=$(trim_ws "$(sanitize_pipe "$raw_title")")
+            if [ -z "$title" ]; then
+                echo -e "${YELLOW}cancelled — empty title${NC}"
+                return
+            fi
         fi
     fi
 
     local target_date="${ACTIVE_DATE:-$(today_date)}"
     local start end description hours="0.00"
 
-    local plabel="$title"
-    [ ${#plabel} -gt 32 ] && plabel="${plabel:0:29}..."
     local tc; tc=$(type_color "$type")
 
     if [ "$target_date" = "$(today_date)" ]; then
@@ -1942,23 +1945,23 @@ log_new_task() {
         local _start_ts; _start_ts=$(date +%s)
         break_state_on_task_start "$_start_ts"
         if [ -n "$resumed" ]; then
-            echo -e "${BLUE}● resumed${NC}  ${tc}[${type}]${NC} ${WHITE}${title}${NC}  ${DIM}@ ${start}${NC}"
+            echo -e "${BLUE}● resumed${NC} ${DIM}@ ${start}${NC}"
         else
-            echo -e "${GREEN}● started${NC}  ${tc}[${type}]${NC} ${WHITE}${title}${NC}  ${DIM}@ ${start}${NC}"
+            echo -e "${GREEN}● started${NC} ${DIM}@ ${start}${NC}"
         fi
 
         echo "$title" > "$TEMP_FILE"
-        read -r -p "$(echo -ne "${CYAN}${plabel}${NC} > ")" description
+        read -r -p "$(echo -ne "${tc}[${type}]${NC} ${BOLD}>${NC} ")" description
         end=$(date +%H:%M)
         [ "$end" = "$start" ] && end=$(adjust_time "$end" 1)
         local _end_ts; _end_ts=$(date +%s)
         break_state_on_task_end "$_end_ts"
     else
-        echo -e "${YELLOW}● backfill${NC} ${DIM}${target_date}${NC}  ${tc}[${type}]${NC} ${WHITE}${title}${NC}"
+        echo -e "${YELLOW}● backfill${NC} ${DIM}${target_date}${NC}"
         start=$(read_time "start" "09:00")
         local default_end; default_end=$(adjust_time "$start" 60)
         end=$(read_time "end" "$default_end")
-        read -r -p "$(echo -ne "${CYAN}${plabel}${NC} > ")" description
+        read -r -p "$(echo -ne "${tc}[${type}]${NC} ${BOLD}>${NC} ")" description
     fi
 
     description=$(trim_ws "$description")
@@ -2406,7 +2409,7 @@ show_help() {
     print_help_row "VIEW"    "$CYAN"    "all" "ls" "stats" "grep"
     print_help_row "EDIT"    "$YELLOW"  "edit" "title" "desc" "type" "bill" "rm"
     print_help_row "SCOPE"   "$MAGENTA" "today" "yesterday" "tomorrow" "goto" "month" "year" "range" "cal" "scope"
-    print_help_row "TOOLS"   "$BLUE"    "export" "profile" "migrate" "clear" "help" "quit"
+    print_help_row "TOOLS"   "$BLUE"    "status" "export" "profile" "migrate" "clear" "help" "quit"
     echo
     help_hint
     echo
@@ -2494,6 +2497,10 @@ show_help_command() {
         scope)      echo -e "  ${BOLD}scope${NC}                        print current scope info and files" ;;
 
         # ---- TOOLS ----
+        status)
+            echo -e "  ${BOLD}status${NC}                       Bildschirmpause snapshot"
+            echo -e "    ${DIM}block start, time worked, time until next break, skip history${NC}"
+            ;;
         export)
             echo -e "  ${BOLD}export${NC}                       write ICS file; email it if SMTP is configured"
             ;;
@@ -2610,7 +2617,7 @@ show_help_category() {
             cmds=("today" "yesterday" "tomorrow" "goto" "month" "year" "range" "cal" "scope") ;;
         tools|tooling)
             label="TOOLS"; color="$BLUE"
-            cmds=("export" "profile" "migrate" "clear" "help" "quit") ;;
+            cmds=("status" "export" "profile" "migrate" "clear" "help" "quit") ;;
         *) return 1 ;;
     esac
     echo -e "  ${BOLD}${color}${label}${NC}"
@@ -2697,6 +2704,7 @@ show_full_help() {
     echo -e "    ${WHITE}scope${NC}                    print current scope info"
     echo
     echo -e "  ${BOLD}TOOLS${NC}"
+    echo -e "    ${WHITE}status${NC}                   Bildschirmpause snapshot (block + skips)"
     echo -e "    ${WHITE}export${NC}                   write ICS, email if SMTP configured"
     echo -e "    ${WHITE}profile${NC}                  show profile values"
     echo -e "    ${WHITE}profile edit${NC}             walk through profile fields"
@@ -2759,6 +2767,86 @@ fmt_main_prompt() {
         fi
         echo -ne "${YELLOW}[${short}]${NC} ${BOLD}${WHITE}>${NC} "
     fi
+}
+
+# Compact break-status banner shown above each prompt iteration.
+# Empty when breaks are disabled or no current block.
+print_break_status_line() {
+    [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 0
+    [ "$BLOCK_START_TS" -le 0 ] && return 0
+    local now; now=$(date +%s)
+    local worked=$((now - BLOCK_START_TS))
+    local until_break=$((BREAK_NEXT_AT_TS - now))
+    local worked_min=$((worked / 60))
+    local block_min=$((BREAK_WORK_BLOCK / 60))
+    local req_min=$((BREAK_NEXT_DURATION_SEC / 60))
+    local skipped_n=${#BREAK_SKIPPED[@]}
+
+    local main_color="$DIM"
+    if [ "$until_break" -lt 600 ]; then main_color="$YELLOW"; fi
+    if [ "$until_break" -le 0 ];  then main_color="$RED";    fi
+
+    local status
+    if [ "$until_break" -gt 0 ]; then
+        local rem_min=$((until_break / 60))
+        status=$(printf "%dm/%dm worked · break in %dm" "$worked_min" "$block_min" "$rem_min")
+    else
+        local over=$(( -until_break / 60 ))
+        status=$(printf "%dm/%dm worked · break OVERDUE %dm" "$worked_min" "$block_min" "$over")
+    fi
+    if [ "$skipped_n" -gt 0 ]; then
+        status+=$(printf " · %d skip · next %dm" "$skipped_n" "$req_min")
+    fi
+    printf "  %b⏱  %s%b\n" "$main_color" "$status" "$NC"
+}
+
+# Detailed break/cycle snapshot for the `status` command.
+show_break_status() {
+    if ! [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]]; then
+        echo
+        echo -e "  ${DIM}Bildschirmpause:${NC} ${YELLOW}disabled${NC}"
+        echo
+        return
+    fi
+    echo
+    echo -e "  ${BOLD}Bildschirmpause status${NC}"
+    if [ "$BLOCK_START_TS" -le 0 ]; then
+        printf "  ${DIM}%-13s${NC}  ${WHITE}%s${NC}\n" "block"      "(none — start a task to begin a cycle)"
+        echo
+        return
+    fi
+    local now; now=$(date +%s)
+    local worked=$((now - BLOCK_START_TS))
+    local block_start; block_start=$(date -d "@$BLOCK_START_TS" +%H:%M)
+    local block_min=$((BREAK_WORK_BLOCK / 60))
+    local req_min=$((BREAK_NEXT_DURATION_SEC / 60))
+    local until_break=$((BREAK_NEXT_AT_TS - now))
+    local next_at; next_at=$(date -d "@$BREAK_NEXT_AT_TS" +%H:%M)
+    local last_end_str="(none yet)"
+    [ "$LAST_END_TS" -gt 0 ] && last_end_str=$(date -d "@$LAST_END_TS" +%H:%M)
+    local skipped_n=${#BREAK_SKIPPED[@]}
+
+    printf "  ${DIM}%-13s${NC}  ${WHITE}started %s — worked %dm of %dm${NC}\n" \
+        "block" "$block_start" "$((worked/60))" "$block_min"
+    printf "  ${DIM}%-13s${NC}  ${WHITE}%s${NC}\n" \
+        "last task end" "$last_end_str"
+    if [ "$until_break" -gt 0 ]; then
+        local rem_min=$((until_break / 60))
+        printf "  ${DIM}%-13s${NC}  ${WHITE}%s${NC} ${DIM}(in %dm, %d min long)${NC}\n" \
+            "next break" "$next_at" "$rem_min" "$req_min"
+    else
+        local over=$(( -until_break / 60 ))
+        printf "  ${DIM}%-13s${NC}  ${RED}OVERDUE${NC} ${DIM}by %dm (was scheduled %s)${NC}\n" \
+            "next break" "$over" "$next_at"
+    fi
+    if [ "$skipped_n" -gt 0 ]; then
+        printf "  ${DIM}%-13s${NC}  ${YELLOW}%d on record${NC}\n" "skipped" "$skipped_n"
+        local s
+        for s in "${BREAK_SKIPPED[@]}"; do
+            echo -e "    ${DIM}skipped ${s}${NC}"
+        done
+    fi
+    echo
 }
 
 # ============================================================
@@ -2839,6 +2927,7 @@ while true; do
         continue
     fi
 
+    print_break_status_line
     if ! IFS= read -r -p "$(fmt_main_prompt)" input; then
         echo
         break
@@ -2927,6 +3016,8 @@ while true; do
                 [ -f "$f" ] && echo -e "    ${DIM}$f${NC}"
             done
             echo ;;
+        status )
+            show_break_status ;;
         migrate )
             migrate_legacy; echo ;;
         clear )
