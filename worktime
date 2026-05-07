@@ -845,6 +845,7 @@ print_task_row() {
         local indent=$((COL_ID + COL_TIME + COL_TYPE + 2*3))
         printf "  %*s${DIM}%s${NC}\n" "$indent" "" "$description"
     fi
+    echo
 }
 
 # Render a totals row (no ID, no description).
@@ -884,7 +885,6 @@ list_scope() {
     local cur="" total=0 count=0 hours_total="0"
     while IFS='|' read -r gid file line date time_range task duration description type hours; do
         if [ "$date" != "$cur" ]; then
-            [ -n "$cur" ] && echo
             printf "  ${DIM}%s${NC}\n" "$date"
             cur="$date"
         fi
@@ -915,7 +915,6 @@ show_last() {
     local cur=""
     tail -n "$count" "$INDEX_FILE" | while IFS='|' read -r gid file line date time_range task duration description type hours; do
         if [ "$date" != "$cur" ]; then
-            [ -n "$cur" ] && echo
             printf "  ${DIM}%s${NC}\n" "$date"
             cur="$date"
         fi
@@ -1156,7 +1155,6 @@ search_tasks() {
     local total=0 count=0 cur="" hours_total="0" billed_minutes=0 billed_count=0
     while IFS='|' read -r gid file line date time_range task duration description type hours; do
         if [ "$date" != "$cur" ]; then
-            [ -n "$cur" ] && echo
             printf "  ${DIM}%s${NC}\n" "$date"
             cur="$date"
         fi
