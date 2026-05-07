@@ -2289,8 +2289,110 @@ breaks_status_color() {
     fi
 }
 
+# Resolve a sub-verb against a CSV list of "alias=canonical" pairs.
+# Echoes the canonical name on success, AMBIG:... when multiple.
+# Args: $1 = input, $2... = list of alias=canonical pairs
+resolve_subverb() {
+    local lc="${1,,}"; shift
+    [ -z "$lc" ] && return 1
+    local -A table=()
+    local pair k v
+    for pair in "$@"; do
+        k="${pair%%=*}"; v="${pair#*=}"
+        table[$k]="$v"
+    done
+    if [ -n "${table[$lc]:-}" ]; then echo "${table[$lc]}"; return 0; fi
+    local -A seen=()
+    local matches=() canon
+    for k in "${!table[@]}"; do
+        if [[ "$k" == "$lc"* ]]; then
+            canon="${table[$k]}"
+            [ -z "${seen[$canon]:-}" ] && { matches+=("$canon"); seen[$canon]=1; }
+        fi
+    done
+    case "${#matches[@]}" in
+        0) return 1 ;;
+        1) echo "${matches[0]}"; return 0 ;;
+        *) local j; j=$(IFS=,; echo "${matches[*]}"); echo "AMBIG:$j"; return 2 ;;
+    esac
+}
+
+handle_scope_cmd() {
+    local args="$1"
+    local first="${args%% *}"
+    local rest="${args#"$first"}"; rest="${rest# }"
+
+    if [ -z "$first" ] || [ "${first,,}" = "show" ]; then
+        printf "  ${MAGENTA}%-12s${NC} %s\n" "scope"       "$SCOPE_LABEL"
+        printf "  ${MAGENTA}%-12s${NC} %s\n" "active date" "${ACTIVE_DATE:-(none)}"
+        printf "  ${MAGENTA}%-12s${NC} %s\n" "files"       "${#SCOPE_FILES[@]}"
+        local f
+        for f in "${SCOPE_FILES[@]}"; do
+            [ -f "$f" ] && echo -e "    ${DIM}$f${NC}"
+        done
+        return
+    fi
+
+    local resolved
+    resolved=$(resolve_subverb "$first" \
+        show=show \
+        today=today \
+        yesterday=yesterday \
+        tomorrow=tomorrow \
+        goto=goto \
+        month=month \
+        year=year \
+        range=range)
+    case $? in
+        2) echo -e "  ${YELLOW}'${first}' is ambiguous: ${resolved#AMBIG:}${NC}"; return ;;
+        1) echo -e "  ${YELLOW}unknown scope verb '${first}' — try 'help scope'${NC}"; return ;;
+    esac
+
+    case "$resolved" in
+        today)
+            scope_set_today
+            echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}" ;;
+        yesterday)
+            shift_active_date -1 && echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}" ;;
+        tomorrow)
+            shift_active_date +1 && echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}" ;;
+        goto)
+            if [ -z "$rest" ]; then
+                echo -e "${RED}usage: scope goto YYYY-MM-DD${NC}"
+            elif scope_set_date "$rest"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC}"
+            fi ;;
+        month)
+            if scope_set_month "$rest"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
+            fi ;;
+        year)
+            if scope_set_year "$rest"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
+            fi ;;
+        range)
+            local s e
+            read -r s e _ <<< "$rest"
+            if [ -z "$s" ] || [ -z "$e" ]; then
+                echo -e "${RED}usage: scope range YYYY-MM-DD YYYY-MM-DD${NC}"
+            elif scope_set_range "$s" "$e"; then
+                echo -e "${CYAN}─ scope${NC}    ${WHITE}$SCOPE_LABEL${NC} ${DIM}(${#SCOPE_FILES[@]} day(s) with logs)${NC}"
+            fi ;;
+    esac
+}
+
 manage_profile() {
-    local sub="${1:-}"
+    local sub_in="${1:-}"
+    local sub="$sub_in"
+    if [ -n "$sub_in" ]; then
+        local r; r=$(resolve_subverb "$sub_in" \
+            show=show view=show edit=edit open=open)
+        case $? in
+            0) sub="$r" ;;
+            2) echo -e "  ${YELLOW}'${sub_in}' is ambiguous: ${r#AMBIG:}${NC}"; return ;;
+            *) ;;  # leave sub unchanged so the catch-all below errors
+        esac
+    fi
     case "$sub" in
         ""|show|view)
             local rate_disp="(unset)"
@@ -2494,7 +2596,18 @@ show_help_command() {
         year)       echo -e "  ${BOLD}year${NC}  [YYYY]                 scope a whole year  (default: current)" ;;
         range)      echo -e "  ${BOLD}range${NC} S E                    scope an arbitrary date range" ;;
         cal|calendar) echo -e "  ${BOLD}cal${NC}   [YYYY-MM]              calendar grid with activity markers" ;;
-        scope)      echo -e "  ${BOLD}scope${NC}                        print current scope info and files" ;;
+        scope)
+            echo -e "  ${BOLD}scope${NC}                        print current scope info and files"
+            echo -e "    ${WHITE}scope <verb> [args]${NC}         nested form (any unique prefix works)"
+            echo -e "      ${WHITE}show${NC}                       same as bare 'scope'"
+            echo -e "      ${WHITE}today${NC}                      reset to today"
+            echo -e "      ${WHITE}yesterday${NC} | ${WHITE}tomorrow${NC}      shift the active date"
+            echo -e "      ${WHITE}goto YYYY-MM-DD${NC}            jump to a specific date"
+            echo -e "      ${WHITE}month [YYYY-MM]${NC}            scope a whole month"
+            echo -e "      ${WHITE}year  [YYYY]${NC}               scope a whole year"
+            echo -e "      ${WHITE}range S E${NC}                  scope an arbitrary range"
+            echo -e "    ${DIM}flat shortcuts (today / yesterday / month / ...) still work.${NC}"
+            ;;
 
         # ---- TOOLS ----
         status)
@@ -2506,8 +2619,10 @@ show_help_command() {
             ;;
         profile|config)
             echo -e "  ${BOLD}profile${NC}                      show profile values"
+            echo -e "    ${WHITE}profile show${NC}               same as bare 'profile'"
             echo -e "    ${WHITE}profile edit${NC}               walk through profile fields"
             echo -e "    ${WHITE}profile open${NC}               open the profile file in \$EDITOR"
+            echo -e "    ${DIM}sub-verbs accept any unique prefix (p s, p e, p o).${NC}"
             ;;
         migrate)
             echo -e "  ${BOLD}migrate${NC}                      move legacy logs into the year/month tree"
@@ -3147,13 +3262,7 @@ while true; do
             fi
             echo ;;
         scope )
-            printf "  ${MAGENTA}%-12s${NC} %s\n" "scope"       "$SCOPE_LABEL"
-            printf "  ${MAGENTA}%-12s${NC} %s\n" "active date" "${ACTIVE_DATE:-(none)}"
-            printf "  ${MAGENTA}%-12s${NC} %s\n" "files"       "${#SCOPE_FILES[@]}"
-            for f in "${SCOPE_FILES[@]}"; do
-                [ -f "$f" ] && echo -e "    ${DIM}$f${NC}"
-            done
-            echo ;;
+            handle_scope_cmd "$args"; echo ;;
         status )
             show_break_status ;;
         migrate )
