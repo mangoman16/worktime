@@ -32,8 +32,15 @@ EXPORT_DIR="$HOME/.task_export"
 PROFILE_FILE="$LOG_DIR/profile"
 LEGACY_SMTP="$HOME/.timelog_smtp_config"
 
-BREAK_INTERVAL=3000        # 50 min idle threshold
-BREAK_LENGTH=600           # 10 min break length
+# Bildschirmpause (Austrian screen-work break) cycle:
+#   * 50 min of continuous screen-work -> 10 min break
+#   * tasks are "continuous" if there's no idle/break gap >= 10 min
+#   * skipping a break delays the next break by one full cycle
+#     (skipped duration + 50 min) and adds 10 min to its required length
+BREAK_WORK_BLOCK=3000      # 50 min work threshold per cycle
+BREAK_GAP_RESET=600        # 10+ min gap (idle or break) resets the cycle
+BREAK_INITIAL_LENGTH=600   # first required break is 10 min
+BREAK_INCREMENT=600        # each skip adds 10 min to the next break
 BREAK_CHECK_INTERVAL=60
 
 mkdir -p "$LOG_DIR" "$EXPORT_DIR"
@@ -42,11 +49,20 @@ INDEX_FILE="$(mktemp -t task_timer_index.XXXXXX)"
 TEMP_FILE="$(mktemp -t task_timer_current.XXXXXX)"
 TS_FILE="$(mktemp -t task_timer_ts.XXXXXX)"
 ALERT_FILE="${TS_FILE}.alert"
+BREAK_DUE_FILE="${TS_FILE}.due"
+LAST_END_FILE="${TS_FILE}.lastend"
 WATCHER_PID=""
+
+# Break-cycle state (main shell only; watcher reads BREAK_DUE_FILE).
+BLOCK_START_TS=0
+LAST_END_TS=0
+BREAK_NEXT_AT_TS=0
+BREAK_NEXT_DURATION_SEC=$BREAK_INITIAL_LENGTH
+BREAK_SKIPPED=()
 
 cleanup() {
     [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null
-    rm -f "$INDEX_FILE" "$TEMP_FILE" "$TS_FILE" "$ALERT_FILE"
+    rm -f "$INDEX_FILE" "$TEMP_FILE" "$TS_FILE" "$ALERT_FILE" "$BREAK_DUE_FILE" "$LAST_END_FILE"
 }
 trap cleanup EXIT
 
@@ -168,7 +184,7 @@ NAME="$name"
 HOURLY_RATE=$rate
 
 # Master break switch. yes/no.
-#   yes -> after $((BREAK_INTERVAL/60)) min idle, prompt for a break
+#   yes -> Bildschirmpause: after $((BREAK_WORK_BLOCK/60)) min screen-work, prompt for a $((BREAK_INITIAL_LENGTH/60)) min break
 #   no  -> never prompt; no idle watcher
 BREAKS_ENABLED="$breaks_en"
 
@@ -250,7 +266,7 @@ interactive_profile_setup() {
     #  2. (only if on) whether to log break entries
     local def_be="y"; [ "$breaks_en" = "no" ] && def_be="n"
     echo
-    echo -e "${DIM}breaks: prompt me for a $((BREAK_LENGTH/60)) min break after $((BREAK_INTERVAL/60)) min idle?${NC}"
+    echo -e "${DIM}Bildschirmpause: prompt me for a $((BREAK_INITIAL_LENGTH/60)) min break after $((BREAK_WORK_BLOCK/60)) min screen-work?${NC}"
     local resp_be; resp_be=$(prompt_yesno "enable break reminders?" "$def_be")
     if [ "$resp_be" = "y" ]; then
         breaks_en="yes"
@@ -341,20 +357,28 @@ start_break_watcher() {
         while [ -f "$TS_FILE" ]; do
             sleep "$BREAK_CHECK_INTERVAL"
             [ -f "$TS_FILE" ] || exit 0
-            local last now delta
-            last=$(cat "$TS_FILE" 2>/dev/null) || continue
-            [[ "$last" =~ ^[0-9]+$ ]] || continue
-            now=$(date +%s)
-            delta=$((now - last))
-            if [ $delta -ge $BREAK_INTERVAL ]; then
-                if command -v notify-send >/dev/null 2>&1; then
-                    notify-send -u normal "Take a break" \
-                        "$((BREAK_INTERVAL/60)) min since last task — step away from the monitor for a bit." \
-                        2>/dev/null || true
-                fi
-                date +%s > "$ALERT_FILE"
-                date +%s > "$TS_FILE"
+            [ -f "$BREAK_DUE_FILE" ] || continue
+            local due; due=$(cat "$BREAK_DUE_FILE" 2>/dev/null)
+            [[ "$due" =~ ^[0-9]+$ ]] || continue
+            [ "$due" -le 0 ] && continue
+            local now; now=$(date +%s)
+            [ "$now" -lt "$due" ] && continue
+            # Long-idle: don't fire — the main shell will reset the
+            # cycle on the next prompt anyway.
+            local last_end=0
+            [ -f "$LAST_END_FILE" ] && last_end=$(cat "$LAST_END_FILE" 2>/dev/null || echo 0)
+            [[ "$last_end" =~ ^[0-9]+$ ]] || last_end=0
+            if [ "$last_end" -gt 0 ] && [ $((now - last_end)) -ge "$BREAK_GAP_RESET" ]; then
+                rm -f "$BREAK_DUE_FILE"
+                continue
             fi
+            if command -v notify-send >/dev/null 2>&1; then
+                notify-send -u normal "Bildschirmpause" \
+                    "$((BREAK_WORK_BLOCK/60)) min screen-work — time for a break." \
+                    2>/dev/null || true
+            fi
+            date +%s > "$ALERT_FILE"
+            rm -f "$BREAK_DUE_FILE"
         done
     ) &
     WATCHER_PID=$!
@@ -1530,14 +1554,179 @@ extend_last_today_end() {
 # ============================================================
 #  Break flow
 # ============================================================
+# ---- Bildschirmpause cycle state ----
+
+break_state_reset() {
+    BLOCK_START_TS=0
+    LAST_END_TS=0
+    BREAK_NEXT_AT_TS=0
+    BREAK_NEXT_DURATION_SEC=$BREAK_INITIAL_LENGTH
+    BREAK_SKIPPED=()
+    rm -f "$BREAK_DUE_FILE" "$LAST_END_FILE"
+}
+
+# Called at task start (when user types title).
+break_state_on_task_start() {
+    [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 0
+    local ts="$1"
+    if [ "$LAST_END_TS" -gt 0 ] && [ $((ts - LAST_END_TS)) -ge "$BREAK_GAP_RESET" ]; then
+        break_state_reset
+    fi
+    if [ "$BLOCK_START_TS" -le 0 ]; then
+        BLOCK_START_TS="$ts"
+        BREAK_NEXT_AT_TS=$((BLOCK_START_TS + BREAK_WORK_BLOCK))
+        BREAK_NEXT_DURATION_SEC=$BREAK_INITIAL_LENGTH
+        BREAK_SKIPPED=()
+        echo "$BREAK_NEXT_AT_TS" > "$BREAK_DUE_FILE"
+    fi
+}
+
+break_state_on_task_end() {
+    [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 0
+    local ts="$1"
+    LAST_END_TS="$ts"
+    echo "$ts" > "$LAST_END_FILE"
+}
+
+# Called once per main-prompt iteration; resets the cycle if the
+# user has been idle long enough to count as a gap.
+break_check_gap_reset() {
+    [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 0
+    [ "$BLOCK_START_TS" -le 0 ] && return 0
+    [ "$LAST_END_TS" -le 0 ] && return 0
+    local now; now=$(date +%s)
+    if [ $((now - LAST_END_TS)) -ge "$BREAK_GAP_RESET" ]; then
+        break_state_reset
+    fi
+}
+
+send_break_email() {
+    smtp_configured || return 0
+    local subject="$1" body="$2"
+    local mf; mf=$(mktemp)
+    {
+        echo "From: $SMTP_FROM"
+        echo "To: $SMTP_TO"
+        echo "Subject: $subject"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: text/plain; charset=UTF-8"
+        echo
+        printf "%s\n" "$body"
+    } > "$mf"
+    local rc
+    if [[ "${SMTP_TLS:-}" == "yes" && "$SMTP_PORT" == "465" ]]; then
+        curl --ssl-reqd --url "smtps://$SMTP_SERVER:$SMTP_PORT" \
+             --user "$SMTP_USER:$SMTP_PASS" \
+             --mail-from "$SMTP_FROM" --mail-rcpt "$SMTP_TO" \
+             --upload-file "$mf" --silent --show-error
+        rc=$?
+    elif [[ "${SMTP_TLS:-}" == "yes" ]]; then
+        curl --url "smtp://$SMTP_SERVER:$SMTP_PORT" --ssl-reqd \
+             --user "$SMTP_USER:$SMTP_PASS" \
+             --mail-from "$SMTP_FROM" --mail-rcpt "$SMTP_TO" \
+             --upload-file "$mf" --silent --show-error
+        rc=$?
+    else
+        curl --url "smtp://$SMTP_SERVER:$SMTP_PORT" \
+             --user "$SMTP_USER:$SMTP_PASS" \
+             --mail-from "$SMTP_FROM" --mail-rcpt "$SMTP_TO" \
+             --upload-file "$mf" --silent --show-error
+        rc=$?
+    fi
+    rm -f "$mf"
+    return $rc
+}
+
+# Compose body listing skipped intervals + the final line for this event.
+break_email_body() {
+    local kind="$1" interval="$2"
+    local body="" s
+    for s in "${BREAK_SKIPPED[@]}"; do
+        body+="skipped ${s}"$'\n'
+    done
+    if [ "$kind" = "taken" ]; then
+        body+="break:  ${interval}"$'\n'
+    else
+        body+="skipped ${interval}"$'\n'
+    fi
+    printf "%s" "$body"
+}
+
+# Entry point when ALERT_FILE is detected by the main loop.
+handle_break_alert() {
+    local req_sec="$BREAK_NEXT_DURATION_SEC"
+    [ "$req_sec" -le 0 ] && req_sec=$BREAK_INITIAL_LENGTH
+    local req_min=$((req_sec / 60))
+    local skipped_n=${#BREAK_SKIPPED[@]}
+
+    echo
+    if [ "$skipped_n" -eq 0 ]; then
+        echo -e "  ${YELLOW}${BOLD}⚠ Bildschirmpause${NC}  ${DIM}$((BREAK_WORK_BLOCK/60)) min screen-work${NC}"
+        echo -e "  ${DIM}take a ${req_min} min break (Austrian eye-rest law).${NC}"
+    elif [ "$skipped_n" -eq 1 ]; then
+        echo -e "  ${RED}${BOLD}⚠ second nudge${NC}  ${DIM}you skipped one break${NC}"
+        echo -e "  ${RED}please take a ${req_min} min break — your eyes will thank you.${NC}"
+    else
+        echo -e "  ${RED}${BOLD}⚠ ${skipped_n} skipped${NC}  ${DIM}escalating${NC}"
+        echo -e "  ${RED}take the ${req_min} min break now — skipping is bad for your health.${NC}"
+    fi
+    local s
+    for s in "${BREAK_SKIPPED[@]}"; do
+        echo -e "    ${DIM}skipped ${s}${NC}"
+    done
+
+    local resp
+    resp=$(prompt_yesno "take a ${req_min} min break?" "y")
+    if [ "$resp" = "y" ]; then
+        do_break_accepted "$req_sec"
+    else
+        do_break_refused "$req_sec"
+    fi
+}
+
+do_break_accepted() {
+    local req_sec="$1"
+    local now; now=$(date +%s)
+    local start; start=$(date -d "@$now" +%H:%M)
+    local end_t; end_t=$(date -d "@$((now + req_sec))" +%H:%M)
+    local body; body=$(break_email_body "taken" "${start}-${end_t}")
+    send_break_email "Bildschirmpause taken: ${start}-${end_t}" "$body" || true
+    handle_break_flow "$req_sec"
+    break_state_reset
+    touch_timestamp
+}
+
+do_break_refused() {
+    local req_sec="$1"
+    local at_ts="$BREAK_NEXT_AT_TS"
+    [ "$at_ts" -le 0 ] && at_ts=$(date +%s)
+    local prop_start; prop_start=$(date -d "@$at_ts" +%H:%M)
+    local prop_end;   prop_end=$(date -d "@$((at_ts + req_sec))" +%H:%M)
+    local interval="${prop_start}-${prop_end}"
+    local body; body=$(break_email_body "skipped" "$interval")
+    send_break_email "Bildschirmpause skipped: ${interval}" "$body" || true
+    BREAK_SKIPPED+=("$interval")
+    BREAK_NEXT_DURATION_SEC=$((BREAK_NEXT_DURATION_SEC + BREAK_INCREMENT))
+    BREAK_NEXT_AT_TS=$((at_ts + req_sec + BREAK_WORK_BLOCK))
+    echo "$BREAK_NEXT_AT_TS" > "$BREAK_DUE_FILE"
+    local next_min=$((BREAK_NEXT_DURATION_SEC / 60))
+    local next_at_str; next_at_str=$(date -d "@$BREAK_NEXT_AT_TS" +%H:%M)
+    echo
+    echo -e "  ${YELLOW}skipped${NC}  ${DIM}${interval}${NC}"
+    echo -e "  ${DIM}next nudge:${NC} ${WHITE}${next_at_str}${NC} ${DIM}for ${next_min} min — please don't skip again.${NC}"
+    echo
+    touch_timestamp
+}
+
 handle_break_flow() {
+    local break_sec="${1:-$BREAK_INITIAL_LENGTH}"
     local file; file=$(get_log_path "$(today_date)")
     local last_line=""
     [ -f "$file" ] && last_line=$(tail -n 1 "$file")
 
     local break_start; break_start=$(date +%H:%M)
     local break_start_ts; break_start_ts=$(date +%s)
-    local break_end; break_end=$(adjust_time "$break_start" $((BREAK_LENGTH/60)))
+    local break_end; break_end=$(adjust_time "$break_start" $((break_sec/60)))
 
     local extended_prev=false
     if [ -n "$last_line" ]; then
@@ -1554,7 +1743,7 @@ handle_break_flow() {
     fi
     echo
 
-    local end_ts=$((break_start_ts + BREAK_LENGTH))
+    local end_ts=$((break_start_ts + break_sec))
     local cancelled=0
     local _line
     local bar_len=20
@@ -1565,7 +1754,7 @@ handle_break_flow() {
         local remain=$((end_ts - now_ts))
         local m=$((remain / 60)) s=$((remain % 60))
         local elapsed=$((now_ts - break_start_ts))
-        local filled=$((elapsed * bar_len / BREAK_LENGTH))
+        local filled=$((elapsed * bar_len / break_sec))
         local empty=$((bar_len - filled))
         local bar="" i
         for ((i=0; i<filled; i++)); do bar+="█"; done
@@ -1585,7 +1774,7 @@ handle_break_flow() {
     local elapsed_min=$((elapsed_sec / 60))
     local elapsed_rem=$((elapsed_sec % 60))
 
-    if [ "$cancelled" -eq 1 ] && [ "$elapsed_sec" -lt "$BREAK_LENGTH" ]; then
+    if [ "$cancelled" -eq 1 ] && [ "$elapsed_sec" -lt "$break_sec" ]; then
         if [ "$extended_prev" = true ]; then
             extend_last_today_end "$return_time"
             local prev_title; prev_title=$(echo "$last_line" | awk -F'|' '{print $3}')
@@ -1608,10 +1797,10 @@ handle_break_flow() {
         print_listing_rule
         print_task_row "" "$break_start-$break_end" "break" "$b_dur" "" "break" "0.00"
     else
-        printf "  ${MAGENTA}─ break${NC}    ${DIM}10m taken (not logged — LOG_BREAKS=no)${NC}\n"
+        printf "  ${MAGENTA}─ break${NC}    ${DIM}%dm taken (not logged — LOG_BREAKS=no)${NC}\n" $((break_sec/60))
     fi
 
-    local end_ts_break=$((break_start_ts + BREAK_LENGTH))
+    local end_ts_break=$((break_start_ts + break_sec))
     if [ "$return_ts" -gt "$end_ts_break" ]; then
         local tail_min=$(( (return_ts - end_ts_break + 30) / 60 ))
         printf "  ${DIM}gap${NC}        ${DIM}%s → %s (%dm unlogged)${NC}\n" \
@@ -1681,6 +1870,8 @@ log_new_task() {
 
     if [ "$target_date" = "$(today_date)" ]; then
         start=$(date +%H:%M)
+        local _start_ts; _start_ts=$(date +%s)
+        break_state_on_task_start "$_start_ts"
         if [ -n "$resumed" ]; then
             echo -e "${BLUE}● resumed${NC}  ${tc}[${type}]${NC} ${WHITE}${title}${NC}  ${DIM}@ ${start}${NC}"
         else
@@ -1691,6 +1882,8 @@ log_new_task() {
         read -r -p "$(echo -ne "${CYAN}${plabel}${NC} > ")" description
         end=$(date +%H:%M)
         [ "$end" = "$start" ] && end=$(adjust_time "$end" 1)
+        local _end_ts; _end_ts=$(date +%s)
+        break_state_on_task_end "$_end_ts"
     else
         echo -e "${YELLOW}● backfill${NC} ${DIM}${target_date}${NC}  ${tc}[${type}]${NC} ${WHITE}${title}${NC}"
         start=$(read_time "start" "09:00")
@@ -2293,12 +2486,21 @@ show_help_topic() {
             echo -e "    EUR is computed from HOURLY_RATE in the profile"
             return 0 ;;
         breaks|break-topic)
-            echo -e "  ${BOLD}BREAKS${NC}"
+            echo -e "  ${BOLD}BREAKS${NC}  ${DIM}(Austrian Bildschirmpause)${NC}"
             echo -e "    status: ${WHITE}$(breaks_status_text)${NC}"
-            echo -e "    yes  ${DIM}->${NC} ends the current task at NOW, runs $((BREAK_LENGTH/60)):00 countdown"
-            echo -e "         ${DIM}->${NC} press enter to return early — same task continues"
-            echo -e "         ${DIM}->${NC} full break done — logs entry only when LOG_BREAKS=yes,"
-            echo -e "            then defaults to ${WHITE}resume${NC} of the prior task"
+            echo -e "    after ${WHITE}$((BREAK_WORK_BLOCK/60)) min${NC} of screen-work you get a ${WHITE}$((BREAK_INITIAL_LENGTH/60)) min${NC} break nudge."
+            echo -e "    multiple short tasks count as continuous if no idle/break gap is"
+            echo -e "    longer than ${WHITE}$((BREAK_GAP_RESET/60)) min${NC}."
+            echo
+            echo -e "    accept ${DIM}->${NC} ends the current task at NOW, runs the countdown"
+            echo -e "             ${DIM}(press enter to return early — same task continues)${NC}"
+            echo -e "             ${DIM}LOG_BREAKS=yes writes a 'break' entry to the log${NC}"
+            echo -e "             ${DIM}email is sent with the taken interval${NC}"
+            echo -e "    refuse ${DIM}->${NC} current task continues uninterrupted"
+            echo -e "             ${DIM}next nudge in 1 hour, $((BREAK_INCREMENT/60)) min longer${NC}"
+            echo -e "             ${DIM}email is sent with the skipped interval${NC}"
+            echo
+            echo -e "    a ${WHITE}$((BREAK_GAP_RESET/60))+ min${NC} idle gap or a logged break resets the cycle."
             return 0 ;;
         flags|cli|startup)
             echo -e "  ${BOLD}STARTUP FLAGS${NC}"
@@ -2447,12 +2649,12 @@ show_full_help() {
     echo -e "    enter decimal hours when prompted: 1 = 1h, 0.5 = 30m, blank = free"
     echo -e "    EUR is computed from HOURLY_RATE in the profile"
     echo
-    echo -e "  ${BOLD}BREAKS${NC}"
-    echo -e "    breaks: ${WHITE}$(breaks_status_text)${NC}"
-    echo -e "    yes  ${DIM}->${NC} ends the current task at NOW, runs $((BREAK_LENGTH/60)):00 countdown"
-    echo -e "         ${DIM}->${NC} press enter to return early — same task continues"
-    echo -e "         ${DIM}->${NC} full break done — logs entry only when LOG_BREAKS=yes,"
-    echo -e "            then defaults to ${WHITE}resume${NC} of the prior task"
+    echo -e "  ${BOLD}BREAKS${NC} ${DIM}(Bildschirmpause)${NC}"
+    echo -e "    status: ${WHITE}$(breaks_status_text)${NC}"
+    echo -e "    after ${WHITE}$((BREAK_WORK_BLOCK/60)) min${NC} screen-work, prompt for a ${WHITE}$((BREAK_INITIAL_LENGTH/60)) min${NC} break"
+    echo -e "    accept -> end task at NOW, run countdown, optional log + email"
+    echo -e "    refuse -> task continues; next nudge +1h, +$((BREAK_INCREMENT/60)) min longer, email"
+    echo -e "    a ${WHITE}$((BREAK_GAP_RESET/60))+ min${NC} gap or logged break resets the cycle"
     echo
 }
 
@@ -2550,18 +2752,10 @@ show_calendar "" minimal
 show_welcome
 
 while true; do
+    break_check_gap_reset
     if [ -f "$ALERT_FILE" ]; then
         rm -f "$ALERT_FILE"
-        echo
-        echo -e "  ${YELLOW}${BOLD}⚠ time for a break?${NC}  ${DIM}$((BREAK_INTERVAL/60)) min since last activity${NC}"
-        resp=$(prompt_yesno "take a $((BREAK_LENGTH/60)) min break?" "y")
-        if [ "$resp" = "y" ]; then
-            handle_break_flow
-        else
-            echo -e "  ${DIM}continuing — next nudge in $((BREAK_INTERVAL/60)) min${NC}"
-            echo
-        fi
-        touch_timestamp
+        handle_break_alert
         continue
     fi
 
