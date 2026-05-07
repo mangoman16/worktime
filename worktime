@@ -1637,18 +1637,14 @@ send_break_email() {
     return $rc
 }
 
-# Compose body listing skipped intervals + the final line for this event.
+# Compose body listing skipped intervals + an optional final taken break.
 break_email_body() {
-    local kind="$1" interval="$2"
+    local taken="$1"
     local body="" s
     for s in "${BREAK_SKIPPED[@]}"; do
         body+="skipped ${s}"$'\n'
     done
-    if [ "$kind" = "taken" ]; then
-        body+="break:  ${interval}"$'\n'
-    else
-        body+="skipped ${interval}"$'\n'
-    fi
+    [ -n "$taken" ] && body+="break:  ${taken}"$'\n'
     printf "%s" "$body"
 }
 
@@ -1662,13 +1658,14 @@ handle_break_alert() {
     echo
     if [ "$skipped_n" -eq 0 ]; then
         echo -e "  ${YELLOW}${BOLD}⚠ Bildschirmpause${NC}  ${DIM}$((BREAK_WORK_BLOCK/60)) min screen-work${NC}"
-        echo -e "  ${DIM}take a ${req_min} min break (Austrian eye-rest law).${NC}"
+        echo -e "  ${DIM}take a ${req_min} min break — \xC2\xA7 BiAV-VO 10/2.${NC}"
+        echo -e "  ${DIM}you may defer it once into the next hour if work requires.${NC}"
     elif [ "$skipped_n" -eq 1 ]; then
-        echo -e "  ${RED}${BOLD}⚠ second nudge${NC}  ${DIM}you skipped one break${NC}"
-        echo -e "  ${RED}please take a ${req_min} min break — your eyes will thank you.${NC}"
+        echo -e "  ${RED}${BOLD}⚠ deferred break due${NC}  ${DIM}take a ${req_min} min break now${NC}"
+        echo -e "  ${RED}refusing again is a VIOLATION of \xC2\xA7 BiAV-VO 10/2 (one deferral max).${NC}"
     else
-        echo -e "  ${RED}${BOLD}⚠ ${skipped_n} skipped${NC}  ${DIM}escalating${NC}"
-        echo -e "  ${RED}take the ${req_min} min break now — skipping is bad for your health.${NC}"
+        echo -e "  ${RED}${BOLD}⚠ VIOLATION cycle${NC}  ${RED}${skipped_n} skip(s) on record${NC}"
+        echo -e "  ${RED}take the ${req_min} min break — every refusal is logged.${NC}"
     fi
     local s
     for s in "${BREAK_SKIPPED[@]}"; do
@@ -1689,8 +1686,14 @@ do_break_accepted() {
     local now; now=$(date +%s)
     local start; start=$(date -d "@$now" +%H:%M)
     local end_t; end_t=$(date -d "@$((now + req_sec))" +%H:%M)
-    local body; body=$(break_email_body "taken" "${start}-${end_t}")
-    send_break_email "Bildschirmpause taken: ${start}-${end_t}" "$body" || true
+    local violations=0
+    [ "${#BREAK_SKIPPED[@]}" -ge 2 ] && violations=$((${#BREAK_SKIPPED[@]} - 1))
+    local body; body=$(break_email_body "${start}-${end_t}")
+    local subject="Bildschirmpause taken: ${start}-${end_t}"
+    if [ "$violations" -gt 0 ]; then
+        subject="Bildschirmpause taken (with ${violations} VIOLATION(s)): ${start}-${end_t}"
+    fi
+    send_break_email "$subject" "$body" || true
     handle_break_flow "$req_sec"
     break_state_reset
     touch_timestamp
@@ -1703,17 +1706,34 @@ do_break_refused() {
     local prop_start; prop_start=$(date -d "@$at_ts" +%H:%M)
     local prop_end;   prop_end=$(date -d "@$((at_ts + req_sec))" +%H:%M)
     local interval="${prop_start}-${prop_end}"
-    local body; body=$(break_email_body "skipped" "$interval")
-    send_break_email "Bildschirmpause skipped: ${interval}" "$body" || true
-    BREAK_SKIPPED+=("$interval")
+    local prior=${#BREAK_SKIPPED[@]}
+    local violation=0
+    [ "$prior" -ge 1 ] && violation=1
+
+    local subject
+    if [ "$violation" -eq 1 ]; then
+        BREAK_SKIPPED+=("${interval} (VIOLATION)")
+        subject="Bildschirmpause VIOLATION: ${interval}"
+    else
+        BREAK_SKIPPED+=("$interval")
+        subject="Bildschirmpause skipped: ${interval}"
+    fi
+    local body; body=$(break_email_body "")
+    send_break_email "$subject" "$body" || true
+
     BREAK_NEXT_DURATION_SEC=$((BREAK_NEXT_DURATION_SEC + BREAK_INCREMENT))
     BREAK_NEXT_AT_TS=$((at_ts + req_sec + BREAK_WORK_BLOCK))
     echo "$BREAK_NEXT_AT_TS" > "$BREAK_DUE_FILE"
     local next_min=$((BREAK_NEXT_DURATION_SEC / 60))
     local next_at_str; next_at_str=$(date -d "@$BREAK_NEXT_AT_TS" +%H:%M)
     echo
-    echo -e "  ${YELLOW}skipped${NC}  ${DIM}${interval}${NC}"
-    echo -e "  ${DIM}next nudge:${NC} ${WHITE}${next_at_str}${NC} ${DIM}for ${next_min} min — please don't skip again.${NC}"
+    if [ "$violation" -eq 1 ]; then
+        echo -e "  ${RED}${BOLD}⚠ VIOLATION${NC}  ${RED}skipping again breaches \xC2\xA7 BiAV-VO 10/2.${NC}"
+        echo -e "  ${RED}skipped${NC}  ${WHITE}${interval}${NC}  ${DIM}(logged + emailed)${NC}"
+    else
+        echo -e "  ${YELLOW}skipped${NC}  ${DIM}${interval}${NC} ${DIM}— legal one-time deferral.${NC}"
+    fi
+    echo -e "  ${DIM}next nudge:${NC} ${WHITE}${next_at_str}${NC} ${DIM}for ${next_min} min.${NC}"
     echo
     touch_timestamp
 }
@@ -2486,19 +2506,20 @@ show_help_topic() {
             echo -e "    EUR is computed from HOURLY_RATE in the profile"
             return 0 ;;
         breaks|break-topic)
-            echo -e "  ${BOLD}BREAKS${NC}  ${DIM}(Austrian Bildschirmpause)${NC}"
+            echo -e "  ${BOLD}BREAKS${NC}  ${DIM}(Austrian Bildschirmpause, BiAV-VO § 10/2)${NC}"
             echo -e "    status: ${WHITE}$(breaks_status_text)${NC}"
             echo -e "    after ${WHITE}$((BREAK_WORK_BLOCK/60)) min${NC} of screen-work you get a ${WHITE}$((BREAK_INITIAL_LENGTH/60)) min${NC} break nudge."
-            echo -e "    multiple short tasks count as continuous if no idle/break gap is"
-            echo -e "    longer than ${WHITE}$((BREAK_GAP_RESET/60)) min${NC}."
+            echo -e "    short tasks count as continuous if no idle/break gap is longer"
+            echo -e "    than ${WHITE}$((BREAK_GAP_RESET/60)) min${NC} (a long gap counts as a Tätigkeitswechsel)."
             echo
             echo -e "    accept ${DIM}->${NC} ends the current task at NOW, runs the countdown"
             echo -e "             ${DIM}(press enter to return early — same task continues)${NC}"
             echo -e "             ${DIM}LOG_BREAKS=yes writes a 'break' entry to the log${NC}"
             echo -e "             ${DIM}email is sent with the taken interval${NC}"
-            echo -e "    refuse ${DIM}->${NC} current task continues uninterrupted"
-            echo -e "             ${DIM}next nudge in 1 hour, $((BREAK_INCREMENT/60)) min longer${NC}"
-            echo -e "             ${DIM}email is sent with the skipped interval${NC}"
+            echo -e "    refuse ${DIM}->${NC} task continues; one deferral is legal (defers into"
+            echo -e "             ${DIM}the next hour). a second refusal is flagged${NC}"
+            echo -e "             ${RED}VIOLATION${NC}${DIM} on screen, in the email subject, and in${NC}"
+            echo -e "             ${DIM}the body next to that interval.${NC}"
             echo
             echo -e "    a ${WHITE}$((BREAK_GAP_RESET/60))+ min${NC} idle gap or a logged break resets the cycle."
             return 0 ;;
