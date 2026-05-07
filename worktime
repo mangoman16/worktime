@@ -1063,42 +1063,81 @@ show_stats() {
 #  Search
 # ============================================================
 search_tasks() {
-    local term="$1"
-    if [ -z "$term" ]; then
-        echo -e "${RED}usage: grep <text> | grep <type> | grep type:<type>${NC}"; return
+    local raw="$1"
+    if [ -z "$raw" ]; then
+        echo -e "${RED}usage:${NC} ${WHITE}grep <term> [<term>...]${NC}"
+        echo -e "  ${DIM}terms:${NC} ${WHITE}title:<text>${NC}${DIM},${NC} ${WHITE}desc:<text>${NC}${DIM},${NC} ${WHITE}type:<prefix>${NC}${DIM},${NC} ${WHITE}<text-or-type>${NC}"
+        return
     fi
     build_index
     if [ "$(index_count)" -eq 0 ]; then
         echo -e "${YELLOW}no tasks in scope.${NC}"; return
     fi
 
-    local mode="text" filter_type=""
-    if [[ "$term" == type:* ]]; then
-        mode="type"; filter_type="${term#type:}"
-    elif [[ "$term" != *" "* ]] && is_known_type "$term"; then
-        mode="type"; filter_type="$term"
-    elif [[ "$term" != *" "* ]]; then
-        # Allow grep <unique-prefix> to filter by type as well.
-        local m; m=$(match_type_prefix "$term")
-        if [ $? -eq 0 ] && [ -n "$m" ]; then
-            mode="type"; filter_type="$m"
-        fi
-    fi
+    # Tokenize on whitespace; each token is one filter, ANDed.
+    local -a tokens
+    read -ra tokens <<< "$raw"
 
-    local matches
-    if [ "$mode" = "type" ]; then
-        if ! is_known_type "$filter_type"; then
-            echo -e "${RED}unknown type '$filter_type'. known: ${TASK_TYPES[*]}${NC}"; return
-        fi
-        matches=$(awk -F'|' -v t="$filter_type" '$9 == t' "$INDEX_FILE")
-        echo -e "${DIM}filter:${NC} type = ${WHITE}$filter_type${NC}"
-    else
-        matches=$(grep -i -- "$term" "$INDEX_FILE" 2>/dev/null || true)
-        echo -e "${DIM}filter:${NC} text ~ ${WHITE}$term${NC}"
-    fi
+    # Resolve each token into (kind, value).
+    local -a KINDS VALUES
+    local label="" t v kind mp rc sep="${DIM} · ${NC}"
+    for t in "${tokens[@]}"; do
+        case "$t" in
+            title:*) kind="title"; v="${t#title:}" ;;
+            desc:*)  kind="desc";  v="${t#desc:}"  ;;
+            type:*)
+                kind="type"; v="${t#type:}"
+                if ! is_known_type "$v"; then
+                    mp=$(match_type_prefix "$v"); rc=$?
+                    case $rc in
+                        0) v="$mp" ;;
+                        2) echo -e "${YELLOW}ambiguous type prefix '${v}' (${mp#AMBIG:})${NC}"; return ;;
+                        *) echo -e "${RED}unknown type '${v}'${NC}"; return ;;
+                    esac
+                fi
+                ;;
+            *)
+                kind="text"; v="$t"
+                mp=$(match_type_prefix "$t"); rc=$?
+                if [ "$rc" -eq 0 ] && [ -n "$mp" ]; then
+                    kind="type"; v="$mp"
+                fi
+                ;;
+        esac
+        KINDS+=("$kind"); VALUES+=("$v")
+        case "$kind" in
+            title) label+="${label:+$sep}${DIM}title~${NC}${WHITE}${v}${NC}" ;;
+            desc)  label+="${label:+$sep}${DIM}desc~${NC}${WHITE}${v}${NC}"  ;;
+            type)  label+="${label:+$sep}${DIM}type=${NC}${WHITE}${v}${NC}"  ;;
+            text)  label+="${label:+$sep}${DIM}text~${NC}${WHITE}${v}${NC}"  ;;
+        esac
+    done
 
+    # Filter index lines.
+    local matches="" line _gid _file _ln _date _tr _ttl _dur _desc _type _hours
+    local i ok k vv ttl_lc desc_lc
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        IFS='|' read -r _gid _file _ln _date _tr _ttl _dur _desc _type _hours <<< "$line"
+        ok=1
+        ttl_lc="${_ttl,,}"
+        desc_lc="${_desc,,}"
+        for ((i=0; i<${#KINDS[@]}; i++)); do
+            k="${KINDS[$i]}"; vv="${VALUES[$i]}"
+            case "$k" in
+                title) [[ "$ttl_lc"  == *"${vv,,}"* ]] || { ok=0; break; } ;;
+                desc)  [[ "$desc_lc" == *"${vv,,}"* ]] || { ok=0; break; } ;;
+                type)  [ "$_type" = "$vv" ] || { ok=0; break; } ;;
+                text)  [[ "$ttl_lc" == *"${vv,,}"* || "$desc_lc" == *"${vv,,}"* ]] || { ok=0; break; } ;;
+            esac
+        done
+        [ "$ok" -eq 1 ] && matches+="$line"$'\n'
+    done < "$INDEX_FILE"
+    matches="${matches%$'\n'}"
+
+    echo -e "${DIM}filter:${NC} $label"
     if [ -z "$matches" ]; then
-        echo -e "${YELLOW}no tasks matching '$term' in scope:${NC} $SCOPE_LABEL"
+        echo -e "${YELLOW}no tasks matching in scope:${NC} $SCOPE_LABEL"
         return
     fi
 
@@ -2053,9 +2092,13 @@ show_help_command() {
             echo -e "  ${BOLD}stats${NC}                        summary, by-type breakdown, billing totals"
             ;;
         grep|search)
-            echo -e "  ${BOLD}grep${NC} <text>                  search titles / descriptions"
-            echo -e "    ${WHITE}grep <type-prefix>${NC}         filter by type prefix"
-            echo -e "    ${WHITE}grep type:<type>${NC}           explicit type filter"
+            echo -e "  ${BOLD}grep${NC} <term> [<term>...]      filter the scope by one or more terms (ANDed)"
+            echo -e "    ${WHITE}title:<text>${NC}               match the title  ${DIM}(case-insensitive substring)${NC}"
+            echo -e "    ${WHITE}desc:<text>${NC}                match the description"
+            echo -e "    ${WHITE}type:<prefix>${NC}              match the type   ${DIM}(any unique prefix)${NC}"
+            echo -e "    ${WHITE}<bare-text>${NC}                if it's a unique type prefix -> filter by type,"
+            echo -e "                                otherwise match title or description"
+            echo -e "    ${DIM}examples:${NC} ${WHITE}grep type:mo${NC}${DIM},${NC} ${WHITE}grep title:server desc:reset${NC}"
             echo -e "    ${DIM}aliases: search${NC}"
             ;;
 
@@ -2256,9 +2299,11 @@ show_full_help() {
     echo -e "    ${WHITE}all${NC}                      list current scope as a table"
     echo -e "    ${WHITE}ls${NC} [n]                   last n entries (default 5)"
     echo -e "    ${WHITE}stats${NC}                    summary, by-type, billing"
-    echo -e "    ${WHITE}grep${NC} <text>              search by title / desc"
-    echo -e "    ${WHITE}grep${NC} <type-prefix>       filter by type"
-    echo -e "    ${WHITE}grep${NC} type:<type>         explicit type filter"
+    echo -e "    ${WHITE}grep${NC} <term> [<term>...]  filter scope by one or more terms (ANDed)"
+    echo -e "      ${WHITE}title:<text>${NC}          match title (substring, case-insensitive)"
+    echo -e "      ${WHITE}desc:<text>${NC}           match description"
+    echo -e "      ${WHITE}type:<prefix>${NC}         match type (any unique prefix)"
+    echo -e "      ${WHITE}<bare-text>${NC}           type-prefix if unique, else title/desc text"
     echo
     echo -e "  ${BOLD}EDIT${NC}"
     echo -e "    ${WHITE}edit${NC}                     re-prompt the LAST field of the last task"
