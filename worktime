@@ -3020,26 +3020,22 @@ show_full_help() {
 # =====================================================================
 # Prompt
 # =====================================================================
-# Two visual rows per iteration. The TOP row is an info strip that
-# extends with state-conditional segments; the BOTTOM row is the
-# input prompt.
+# Two visual rows when something is happening, otherwise just one.
 #
-#   [today]   3t/1h24m   last #6 [task] fix bug 20m   bar 09:00
+# Today (no breaks):
 #   14:21 ❯
 #
-# Segments shown:
-#   [scope]    always — magenta when multi-day (range/month/...),
-#              yellow on backfill (yesterday/tomorrow/explicit
-#              date), blue muted on plain today
-#   Nt/Hh:Mm   total tasks + minutes for the active scope (omitted
-#              when the scope is empty)
-#   last ...   id + type tag + truncated title + duration of the
-#              latest entry in scope (omitted when scope is empty)
-#   bar  MM:SS countdown to the next break, with a 30-char unicode
-#              progress bar; dim -> yellow (<10 min) -> red (+MM:SS
-#              overdue). Skip count appended in red.
-# When NO segment is active (fresh start, breaks disabled) the
-# top row is suppressed and only 'HH:MM ❯' is printed.
+# Today (block running):
+#   [ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╶╶╶╶ 09:00 ]
+#   14:21 ❯
+#
+# Yesterday + block running:
+#   [ yesterday ]  [ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╶╶╶╶ 09:00 ]
+#   14:21 ❯
+#
+# Each segment is bracketed `[ content ]`, brackets dim, content
+# coloured by what it represents. For 'today' (the default scope)
+# we suppress the scope tag - it's pure noise.
 
 # Generic progress bar. Args: width elapsed total. Output: a
 # unicode bar with "━" (filled) and "╶" (empty) of the given width.
@@ -3056,39 +3052,8 @@ progress_bar() {
     printf "%s" "$out"
 }
 
-# Compute (count, minutes) for the current scope. Two-token output.
-prompt_scope_totals() {
-    [ -s "$INDEX_FILE" ] || build_index
-    local count=0 mins=0 _g _f _l _d _r _t _du _de _ty _h _m
-    if [ -s "$INDEX_FILE" ]; then
-        while IFS='|' read -r _g _f _l _d _r _t _du _de _ty _h; do
-            count=$((count + 1))
-            _m=$(duration_to_minutes "$_du")
-            mins=$((mins + _m))
-        done < "$INDEX_FILE"
-    fi
-    printf "%d %d" "$count" "$mins"
-}
-
-# Build a colored last-task summary for the prompt info line, or
-# nothing if there's no last entry in scope.
-prompt_last_task_segment() {
-    [ -s "$INDEX_FILE" ] || build_index
-    [ "$(index_count)" -gt 0 ] || return 1
-    local last; last=$(tail -1 "$INDEX_FILE")
-    [ -n "$last" ] || return 1
-    local lg lf ll ld lr lt ldu lde lty lh
-    IFS='|' read -r lg lf ll ld lr lt ldu lde lty lh <<< "$last"
-    lt="${lt//$'\r'/}"; ldu="${ldu//$'\r'/}"; lty="${lty//$'\r'/}"
-    local lc; lc=$(type_color "${lty:-task}")
-    local short_title="$lt"
-    if [ "${#short_title}" -gt 24 ]; then
-        short_title="${short_title:0:23}…"
-    fi
-    printf "%s" "${DIM}last${NC} ${DIM}#${NC}${WHITE}${lg}${NC} ${lc}[${lty}]${NC} ${WHITE}${short_title}${NC} ${DIM}${ldu}${NC}"
-}
-
-# Build the colored break-bar segment, or nothing when no block.
+# Build the colored break-bar segment (already wrapped in
+# [ ... ] brackets), or nothing when no block is active.
 prompt_break_segment() {
     [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 1
     [ "$BLOCK_START_TS" -gt 0 ] || return 1
@@ -3107,18 +3072,16 @@ prompt_break_segment() {
         local over=$((-remain))
         cd=$(printf "+%02d:%02d" "$((over / 60))" "$((over % 60))")
     fi
-    local out
-    out=$(printf "%s%s%s %s%s%s" "$color" "$bar" "$NC" "$color" "$cd" "$NC")
+    local body="${color}${bar}${NC} ${color}${cd}${NC}"
     local skipped_n=${#BREAK_SKIPPED[@]}
     if [ "$skipped_n" -gt 0 ]; then
-        out+=$(printf " %s%dskip%s" "$RED" "$skipped_n" "$NC")
+        body+=" ${RED}${skipped_n}skip${NC}"
     fi
-    printf "%s" "$out"
+    printf "%s" "${DIM}[${NC} ${body} ${DIM}]${NC}"
 }
 
-# Compose the full prompt (info row + input row). Returns a string
-# suitable for `read -p`. Multi-line when info segments exist,
-# single line otherwise.
+# Compose the full prompt. Two-line when any segment is present,
+# one-line otherwise.
 fmt_simple_prompt() {
     local time_str; time_str=$(date +%H:%M)
     local active="${ACTIVE_DATE:-$(today_date)}"
@@ -3126,56 +3089,34 @@ fmt_simple_prompt() {
 
     local segs=()
 
-    # Scope tag — always shown.
+    # Scope tag — only shown when the active scope is NOT plain today.
     if [ -z "${ACTIVE_DATE:-}" ]; then
-        segs+=("$(printf "%s[%s]%s" "$MAGENTA" "$SCOPE_LABEL" "$NC")")
-    elif [ "$active" = "$today" ]; then
-        segs+=("$(printf "%s[today]%s" "$DIM" "$NC")")
-    else
+        segs+=("${DIM}[${NC} ${MAGENTA}${SCOPE_LABEL}${NC} ${DIM}]${NC}")
+    elif [ "$active" != "$today" ]; then
         local short="$active"
         if [ "$active" = "$(date -d '1 day ago' +%Y-%m-%d 2>/dev/null)" ]; then
             short="yesterday"
         elif [ "$active" = "$(date -d 'tomorrow' +%Y-%m-%d 2>/dev/null)" ]; then
             short="tomorrow"
         fi
-        segs+=("$(printf "%s[%s]%s" "$YELLOW" "$short" "$NC")")
+        segs+=("${DIM}[${NC} ${YELLOW}${short}${NC} ${DIM}]${NC}")
     fi
 
-    # Totals for the active scope.
-    local count mins
-    read -r count mins <<< "$(prompt_scope_totals)"
-    if [ "${count:-0}" -gt 0 ]; then
-        local h=$((mins / 60)) m=$((mins % 60)) mins_str
-        if [ "$h" -gt 0 ]; then
-            mins_str=$(printf "%dh%02dm" "$h" "$m")
-        else
-            mins_str=$(printf "%dm" "$m")
-        fi
-        segs+=("${WHITE}${count}t${NC}${DIM}/${NC}${WHITE}${mins_str}${NC}")
-
-        local last_seg; last_seg=$(prompt_last_task_segment) && \
-            segs+=("$last_seg")
-    fi
-
-    # Break bar.
     local bar_seg; bar_seg=$(prompt_break_segment) && segs+=("$bar_seg")
 
     local prompt_line
     prompt_line=$(printf "%s%s%s %s❯%s " \
         "$DIM" "$time_str" "$NC" "$BOLD" "$NC")
 
-    # When we only have the [today] tag and nothing else, suppress
-    # the info row — it's pure noise.
-    if [ "${#segs[@]}" -le 1 ] && [[ "${segs[0]}" == *"[today]"* ]]; then
+    if [ "${#segs[@]}" -eq 0 ]; then
         printf "%s" "$prompt_line"
         return
     fi
 
-    local IFS=$'\n'
-    local row="${segs[0]}"
+    local row="  ${segs[0]}"
     local i
     for ((i=1; i<${#segs[@]}; i++)); do
-        row+="   ${segs[$i]}"
+        row+="  ${segs[$i]}"
     done
     printf "%s\n%s" "$row" "$prompt_line"
 }
