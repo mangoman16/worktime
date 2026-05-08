@@ -2009,6 +2009,11 @@ log_new_task() {
 
         echo "$title" > "$TEMP_FILE"
         if ! prompt_description_for_task; then
+            # Treat the cancel as a task-end for break-state purposes;
+            # otherwise BLOCK_START_TS stays set with no LAST_END_TS
+            # and the gap-reset logic can't fire on the next idle.
+            local _cancel_ts; _cancel_ts=$(date +%s)
+            break_state_on_task_end "$_cancel_ts"
             rm -f "$TEMP_FILE"
             return
         fi
@@ -2432,9 +2437,18 @@ dispatch_command() {
             fi
             echo ;;
         scope)             handle_scope_cmd "$args"; echo ;;
-        status)            show_break_status ;;
+        status)            show_break_status; echo ;;
         migrate)           migrate_legacy; echo ;;
-        clear)             clear ;;
+        clear)
+            clear
+            # If we're mid-task (called from the desc prompt), the
+            # started indicator was just wiped - reprint it so the
+            # user can still see the task they're typing for.
+            if [ -s "$TEMP_FILE" ]; then
+                local _t; _t=$(cat "$TEMP_FILE")
+                echo -e "${GREEN}● in progress${NC} ${DIM}-${NC} ${WHITE}${_t}${NC}"
+            fi
+            ;;
         help|"?")          show_help_dispatch "$args" ;;
         *)                 return 1 ;;
     esac
