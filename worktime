@@ -1826,23 +1826,34 @@ handle_break_flow() {
     local end_ts=$((break_start_ts + break_sec))
     local cancelled=0
     local _line
+    local first=1
 
     while :; do
         local now_ts; now_ts=$(date +%s)
         if [ "$now_ts" -ge "$end_ts" ]; then break; fi
         local remain=$((end_ts - now_ts))
         local m=$((remain / 60)) s=$((remain % 60))
-        local elapsed=$((now_ts - break_start_ts))
-        local bar; bar=$(progress_bar 30 "$elapsed" "$break_sec")
-        printf "\r  %s%s%s  %sreturn in %02d:%02d   ↵ early%s   " \
-            "$CYAN" "$bar" "$NC" \
-            "$DIM" "$m" "$s" "$NC"
+        local cd; cd=$(printf "%02d:%02d" "$m" "$s")
+        local break_b; break_b=$(printf "%s[%sbreak %s%s]%s" \
+            "$DIM" "$CYAN" "$cd" "$DIM" "$NC")
+        local top; top=$(fmt_tree_top "$break_b")
+
+        if [ "$first" -eq 1 ]; then
+            printf "%s\n%s└%s ${DIM}↵ to skip${NC}" "$top" "$DIM" "$NC"
+            first=0
+        else
+            # cursor up one line, col 0, clear top line, redraw,
+            # newline, clear cursor line, redraw bottom, leave
+            # cursor at end of bottom.
+            printf "\r\033[1A\033[2K%s\n\033[2K%s└%s ${DIM}↵ to skip${NC}" \
+                "$top" "$DIM" "$NC"
+        fi
         if read -t 1 -r _line; then
             cancelled=1
             break
         fi
     done
-    printf "\r%-80s\r" ""
+    printf "\n"
 
     local return_ts; return_ts=$(date +%s)
     local return_time; return_time=$(date -d "@$return_ts" +%H:%M)
@@ -1922,7 +1933,7 @@ handle_break_flow() {
 prompt_description_for_task() {
     while :; do
         local raw
-        read -r -p "$(printf '%s[%s]%s %s>%s ' "$tc" "$type" "$NC" "$BOLD" "$NC")" raw
+        read -r -p "$(fmt_desc_prompt "$type" "$title")" raw
         local trimmed; trimmed=$(trim_ws "$raw")
 
         if [ -z "$trimmed" ]; then
@@ -3020,25 +3031,23 @@ show_full_help() {
 # =====================================================================
 # Prompt
 # =====================================================================
-# Two visual rows when something is happening, otherwise just one.
+# Tree-style multi-line prompt. Top line is the always-visible
+# header; intermediate lines (├─) appear when context exists; the
+# bottom (└) is the input cursor.
 #
-# Today (no breaks):
-#   14:21 ❯
+# Idle:
+#   ┌ 10:42 [49m]
+#   └
 #
-# Today (block running):
-#   [ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╶╶╶╶ 09:00 ]
-#   14:21 ❯
+# Mid-task (description prompt):
+#   ┌ 10:42 [49m]
+#   ├─ [ticket] #999 fix login
+#   └
 #
-# Yesterday + block running:
-#   [ yesterday ]  [ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╶╶╶╶ 09:00 ]
-#   14:21 ❯
-#
-# Each segment is bracketed `[ content ]`, brackets dim, content
-# coloured by what it represents. For 'today' (the default scope)
-# we suppress the scope tag - it's pure noise.
+# In-break (handle_break_flow): the [49m] bracket becomes
+#   [break 09:30] in cyan.
 
-# Generic progress bar. Args: width elapsed total. Output: a
-# unicode bar with "━" (filled) and "╶" (empty) of the given width.
+# Generic progress bar - used by handle_break_flow.
 progress_bar() {
     local w="$1" e="$2" t="$3"
     local filled=0
@@ -3052,46 +3061,40 @@ progress_bar() {
     printf "%s" "$out"
 }
 
-# Build the colored break-bar segment (already wrapped in
-# [ ... ] brackets), or nothing when no block is active.
-prompt_break_segment() {
-    [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 1
-    [ "$BLOCK_START_TS" -gt 0 ] || return 1
+# Break-info bracket for the tree-top, e.g. '[49m]' / '[+5m]'
+# while working. Empty when breaks are off or no block.
+fmt_break_bracket() {
+    [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 0
+    [ "$BLOCK_START_TS" -gt 0 ] || return 0
     local now; now=$(date +%s)
-    local elapsed=$((now - BLOCK_START_TS))
-    [ "$elapsed" -lt 0 ] && elapsed=0
     local remain=$((BREAK_NEXT_AT_TS - now))
     local color="$DIM"
     [ "$remain" -gt 0 ] && [ "$remain" -lt 600 ] && color="$YELLOW"
     [ "$remain" -le 0 ] && color="$RED"
-    local bar; bar=$(progress_bar 30 "$elapsed" "$BREAK_WORK_BLOCK")
-    local cd
-    if [ "$remain" -gt 0 ]; then
-        cd=$(printf "%02d:%02d" "$((remain / 60))" "$((remain % 60))")
+    local txt
+    if [ "$remain" -ge 60 ]; then
+        txt="$((remain / 60))m"
+    elif [ "$remain" -gt 0 ]; then
+        txt="1m"
+    elif [ "$remain" -eq 0 ]; then
+        txt="BREAK"
     else
         local over=$((-remain))
-        cd=$(printf "+%02d:%02d" "$((over / 60))" "$((over % 60))")
+        if [ "$over" -ge 60 ]; then
+            txt="+$((over / 60))m"
+        else
+            txt="+1m"
+        fi
     fi
-    local body="${color}${bar}${NC} ${color}${cd}${NC}"
-    local skipped_n=${#BREAK_SKIPPED[@]}
-    if [ "$skipped_n" -gt 0 ]; then
-        body+=" ${RED}${skipped_n}skip${NC}"
-    fi
-    printf "%s" "${DIM}[${NC} ${body} ${DIM}]${NC}"
+    printf "%s[%s%s%s]%s" "$DIM" "$color" "$txt" "$DIM" "$NC"
 }
 
-# Compose the full prompt. Two-line when any segment is present,
-# one-line otherwise.
-fmt_simple_prompt() {
-    local time_str; time_str=$(date +%H:%M)
+# Scope bracket, e.g. '[yesterday]'. Empty when scope is plain today.
+fmt_scope_bracket() {
     local active="${ACTIVE_DATE:-$(today_date)}"
     local today; today=$(today_date)
-
-    local segs=()
-
-    # Scope tag — only shown when the active scope is NOT plain today.
     if [ -z "${ACTIVE_DATE:-}" ]; then
-        segs+=("${DIM}[${NC} ${MAGENTA}${SCOPE_LABEL}${NC} ${DIM}]${NC}")
+        printf "%s[%s%s%s]%s" "$DIM" "$MAGENTA" "$SCOPE_LABEL" "$DIM" "$NC"
     elif [ "$active" != "$today" ]; then
         local short="$active"
         if [ "$active" = "$(date -d '1 day ago' +%Y-%m-%d 2>/dev/null)" ]; then
@@ -3099,26 +3102,43 @@ fmt_simple_prompt() {
         elif [ "$active" = "$(date -d 'tomorrow' +%Y-%m-%d 2>/dev/null)" ]; then
             short="tomorrow"
         fi
-        segs+=("${DIM}[${NC} ${YELLOW}${short}${NC} ${DIM}]${NC}")
+        printf "%s[%s%s%s]%s" "$DIM" "$YELLOW" "$short" "$DIM" "$NC"
     fi
+}
 
-    local bar_seg; bar_seg=$(prompt_break_segment) && segs+=("$bar_seg")
-
-    local prompt_line
-    prompt_line=$(printf "%s%s%s %s❯%s " \
-        "$DIM" "$time_str" "$NC" "$BOLD" "$NC")
-
-    if [ "${#segs[@]}" -eq 0 ]; then
-        printf "%s" "$prompt_line"
-        return
+# Top tree-line: '┌ HH:MM [scope] [49m]'.
+# Optional first arg overrides the break bracket (used by the
+# in-break flow to render '[break MM:SS]' in cyan).
+fmt_tree_top() {
+    local override_break="${1-}"
+    local time_str; time_str=$(date +%H:%M)
+    local scope_b; scope_b=$(fmt_scope_bracket)
+    local break_b
+    if [ -n "$override_break" ]; then
+        break_b="$override_break"
+    else
+        break_b=$(fmt_break_bracket)
     fi
+    local out="${DIM}┌${NC} ${DIM}${time_str}${NC}"
+    [ -n "$scope_b" ] && out+=" $scope_b"
+    [ -n "$break_b" ] && out+=" $break_b"
+    printf "%s" "$out"
+}
 
-    local row="  ${segs[0]}"
-    local i
-    for ((i=1; i<${#segs[@]}; i++)); do
-        row+="  ${segs[$i]}"
-    done
-    printf "%s\n%s" "$row" "$prompt_line"
+# Main prompt: tree-top above, '└ ' below.
+fmt_simple_prompt() {
+    local top; top=$(fmt_tree_top)
+    printf "%s\n%s└%s " "$top" "$DIM" "$NC"
+}
+
+# Description prompt: tree-top, '├─ [type] title', '└ '.
+fmt_desc_prompt() {
+    local type="$1" title="$2"
+    local tc; tc=$(type_color "$type")
+    local top; top=$(fmt_tree_top)
+    local mid="${DIM}├─${NC} ${tc}[${type}]${NC}"
+    [ -n "$title" ] && mid+=" ${WHITE}${title}${NC}"
+    printf "%s\n%s\n%s└%s " "$top" "$mid" "$DIM" "$NC"
 }
 
 # Detailed break/cycle snapshot for the `status` command.
