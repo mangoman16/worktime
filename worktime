@@ -1164,7 +1164,7 @@ search_tasks() {
 
     # Resolve each token into (kind, value).
     local -a KINDS VALUES
-    local label="" t v kind mp rc sep="${DIM} · ${NC}"
+    local label="" t v kind mp rc sep="${DIM}  ${NC}"
     for t in "${tokens[@]}"; do
         case "$t" in
             title:*)  kind="title";  v="${t#title:}"  ;;
@@ -1262,7 +1262,7 @@ search_tasks() {
         local eur; eur=$(format_eur_for_hours "$hours_total")
         [ -z "$eur" ] && eur="(set HOURLY_RATE)"
         echo
-        printf "  ${DIM}billed${NC}  ${GREEN}%d entries · %s worked → %s %s${NC}\n" \
+        printf "  ${DIM}billed${NC}  ${GREEN}%d entries  %s worked → %s %s${NC}\n" \
             "$billed_count" "$(format_minutes $billed_minutes)" \
             "$(format_hours "$hours_total")" "$eur"
     fi
@@ -1826,7 +1826,7 @@ handle_break_flow() {
         local m=$((remain / 60)) s=$((remain % 60))
         local elapsed=$((now_ts - break_start_ts))
         local bar; bar=$(progress_bar 30 "$elapsed" "$break_sec")
-        printf "\r  %s%s%s  %sreturn in %02d:%02d  ·  ↵ early%s   " \
+        printf "\r  %s%s%s  %sreturn in %02d:%02d   ↵ early%s   " \
             "$CYAN" "$bar" "$NC" \
             "$DIM" "$m" "$s" "$NC"
         if read -t 1 -r _line; then
@@ -2772,7 +2772,7 @@ show_help_command() {
             ;;
         help|"?")
             echo -e "  ${BOLD}help${NC}                         compact command summary"
-            echo -e "    ${WHITE}help <category>${NC}            logging · view · editing · scoping · tools"
+            echo -e "    ${WHITE}help <category>${NC}            logging  view  editing  scoping  tools"
             echo -e "    ${WHITE}help <command>${NC}             details for one command"
             echo -e "    ${WHITE}help <topic>${NC}               topic ref: types, billing, breaks, flags"
             echo -e "    ${WHITE}help full${NC}                  show everything on one screen"
@@ -3006,49 +3006,13 @@ show_full_help() {
 # ============================================================
 #  Contextual main prompt
 # ============================================================
-# Single-line break-status banner shown above the prompt. Refreshes
-# once per main-loop iteration (same cadence as the prompt's HH:MM).
-# Layout (work phase, normal):
-#   ━━━━━━━━━━━━━━━━━━━━━╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶  worked 11m  ·  break in 39:24
-# Becomes yellow when <10 min remain, red when overdue (BREAK DUE
-# +MM:SS). Empty (no line printed) when breaks are off or no block.
-fmt_countdown_line() {
-    if ! [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] \
-        || [ "$BLOCK_START_TS" -le 0 ]; then
-        printf ""
-        return
-    fi
-    local now; now=$(date +%s)
-    local block_len=$BREAK_WORK_BLOCK
-    local elapsed=$((now - BLOCK_START_TS))
-    [ "$elapsed" -lt 0 ] && elapsed=0
-    local remain=$((BREAK_NEXT_AT_TS - now))
-
-    local color="$DIM"
-    [ "$remain" -gt 0 ] && [ "$remain" -lt 600 ] && color="$YELLOW"
-    [ "$remain" -le 0 ] && color="$RED"
-
-    local bar; bar=$(progress_bar 30 "$elapsed" "$block_len")
-    local elapsed_min=$((elapsed / 60))
-
-    local right
-    if [ "$remain" -gt 0 ]; then
-        local rm=$((remain / 60)) rs=$((remain % 60))
-        right=$(printf "break in %02d:%02d" "$rm" "$rs")
-    else
-        local over=$((-remain))
-        right=$(printf "BREAK DUE  +%02d:%02d" \
-            "$((over / 60))" "$((over % 60))")
-    fi
-
-    local skipped_n=${#BREAK_SKIPPED[@]}
-    local skip_part=""
-    [ "$skipped_n" -gt 0 ] && skip_part=$(printf "  ${RED}· %d skip${NC}" "$skipped_n")
-
-    printf "  %s%s%s  %sworked %dm  ·  %s%s%s" \
-        "$color" "$bar" "$NC" \
-        "$DIM" "$elapsed_min" "$right" "$NC" "$skip_part"
-}
+# Prompt: scope tag, HH:MM, optional in-line break-progress bar +
+# countdown, then '>'. The bar fills as the work block elapses.
+# Color escalates dim -> yellow (<10 min remain) -> red (overdue;
+# countdown becomes +MM:SS).
+#
+#   HH:MM ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╶╶╶╶ 09:00 >
+#   [yesterday] HH:MM >                                         (no block)
 
 # Generic progress bar. Args: width elapsed total. Output: a
 # unicode bar with "━" (filled) and "╶" (empty) of the given width.
@@ -3065,7 +3029,6 @@ progress_bar() {
     printf "%s" "$out"
 }
 
-# Bottom-line prompt: scope tag, current HH:MM, '>'.
 fmt_simple_prompt() {
     local time_str; time_str=$(date +%H:%M)
     local active="${ACTIVE_DATE:-$(today_date)}"
@@ -3084,7 +3047,34 @@ fmt_simple_prompt() {
         scope_tag="${YELLOW}[${short}]${NC} "
     fi
 
-    printf "%s%s%s%s %s>%s " "$scope_tag" "$DIM" "$time_str" "$NC" "$BOLD" "$NC"
+    local bar_part=""
+    if [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] && [ "$BLOCK_START_TS" -gt 0 ]; then
+        local now; now=$(date +%s)
+        local elapsed=$((now - BLOCK_START_TS))
+        [ "$elapsed" -lt 0 ] && elapsed=0
+        local remain=$((BREAK_NEXT_AT_TS - now))
+        local color="$DIM"
+        [ "$remain" -gt 0 ] && [ "$remain" -lt 600 ] && color="$YELLOW"
+        [ "$remain" -le 0 ] && color="$RED"
+        local bar; bar=$(progress_bar 30 "$elapsed" "$BREAK_WORK_BLOCK")
+        local cd
+        if [ "$remain" -gt 0 ]; then
+            cd=$(printf "%02d:%02d" "$((remain / 60))" "$((remain % 60))")
+        else
+            local over=$((-remain))
+            cd=$(printf "+%02d:%02d" "$((over / 60))" "$((over % 60))")
+        fi
+        local skip_part=""
+        local skipped_n=${#BREAK_SKIPPED[@]}
+        [ "$skipped_n" -gt 0 ] && skip_part=$(printf " %s%dskip%s" "$RED" "$skipped_n" "$NC")
+        bar_part=$(printf " %s%s%s %s%s%s%s" "$color" "$bar" "$NC" "$color" "$cd" "$NC" "$skip_part")
+    fi
+
+    printf "%s%s%s%s%s %s>%s " \
+        "$scope_tag" \
+        "$DIM" "$time_str" "$NC" \
+        "$bar_part" \
+        "$BOLD" "$NC"
 }
 
 # Detailed break/cycle snapshot for the `status` command.
@@ -3214,12 +3204,6 @@ while true; do
         continue
     fi
 
-    # Top line: countdown to next break. Printed once per iteration
-    # (refreshes when the user hits enter, same cadence as HH:MM).
-    # When breaks are off or no block is active, the helper emits
-    # nothing and we skip the line entirely.
-    _cd=$(fmt_countdown_line)
-    [ -n "$_cd" ] && printf "%s\n" "$_cd"
     if ! IFS= read -r -p "$(fmt_simple_prompt)" input; then
         echo
         break
