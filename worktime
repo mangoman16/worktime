@@ -550,6 +550,14 @@ index_count() {
 
 parse_index_line() {
     IFS='|' read -r I_GID I_FILE I_LINE I_DATE I_RANGE I_TITLE I_DUR I_DESC I_TYPE I_HOURS <<< "$1"
+    # Defensive: strip any stray CR (Windows line endings, copy-paste
+    # into the file) so padding/display widths line up correctly.
+    I_RANGE="${I_RANGE//$'\r'/}"
+    I_TITLE="${I_TITLE//$'\r'/}"
+    I_DUR="${I_DUR//$'\r'/}"
+    I_DESC="${I_DESC//$'\r'/}"
+    I_TYPE="${I_TYPE//$'\r'/}"
+    I_HOURS="${I_HOURS//$'\r'/}"
 }
 
 # ============================================================
@@ -1308,7 +1316,7 @@ delete_task() {
     echo -e "${RED}─ deleted${NC}"
     print_listing_header
     print_listing_rule
-    print_task_row "" "$I_RANGE" "$I_TITLE" "$I_DUR" "$I_DESC" "$I_TYPE" "$I_HOURS"
+    print_task_row "$id" "$I_RANGE" "$I_TITLE" "$I_DUR" "$I_DESC" "$I_TYPE" "$I_HOURS"
     [ -s "$I_FILE" ] || rm -f "$I_FILE"
 
     # If we deleted the "last" task itself, clear the cache.
@@ -1393,7 +1401,7 @@ edit_task_full() {
     echo -e "${GREEN}─ updated${NC}"
     print_listing_header
     print_listing_rule
-    print_task_row "" "$new_start-$new_end" "$new_title" "$new_duration" "$new_description" "$new_type" "$new_hours"
+    print_task_row "$I_GID" "$new_start-$new_end" "$new_title" "$new_duration" "$new_description" "$new_type" "$new_hours"
 
     LAST_TASK_FILE="$I_FILE"
     LAST_TASK_LINE="$I_LINE"
@@ -1463,7 +1471,7 @@ edit_task_field() {
     echo -e "${GREEN}─ updated${NC} ${DIM}${field}${NC}"
     print_listing_header
     print_listing_rule
-    print_task_row "" "$cur_start-$cur_end" "$cur_title" "$new_dur" "$cur_desc" "$cur_type" "$cur_hours"
+    print_task_row "$I_GID" "$cur_start-$cur_end" "$cur_title" "$new_dur" "$cur_desc" "$cur_type" "$cur_hours"
 
     LAST_TASK_FILE="$I_FILE"
     LAST_TASK_LINE="$I_LINE"
@@ -1860,11 +1868,14 @@ handle_break_flow() {
         local b_dur; b_dur=$(calculate_duration "$break_start" "$break_end")
         ensure_log_path "$(today_date)" >/dev/null
         echo "$(today_date)|$break_start-$break_end|break|$b_dur||break|0.00" >> "$file"
+        LAST_TASK_FILE="$file"
+        LAST_TASK_LINE=$(wc -l < "$file")
+        refresh_last_id
         local _bc; _bc=$(type_color "break")
         echo -e "  ${_bc}─ break${NC}    logged"
         print_listing_header
         print_listing_rule
-        print_task_row "" "$break_start-$break_end" "break" "$b_dur" "" "break" "0.00"
+        print_task_row "$LAST_TASK_ID" "$break_start-$break_end" "break" "$b_dur" "" "break" "0.00"
     else
         local _bc; _bc=$(type_color "break")
         printf "  ${_bc}─ break${NC}    ${DIM}%dm taken (not logged — LOG_BREAKS=no)${NC}\n" $((break_sec/60))
