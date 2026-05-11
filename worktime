@@ -231,7 +231,7 @@ prompt_yesno() {
     local label="$1" def="$2" hint resp
     if [ "$def" = "y" ]; then hint="[Y/n]"; else hint="[y/N]"; fi
     while :; do
-        read -r -p "$(echo -ne "${DIM}${label}${NC} ${WHITE}${hint}${NC} ${BOLD}>${NC} ")" resp
+        read -r -p "$(echo -ne "${DIM}${label}${NC} ${WHITE}${hint}${NC} ${BOLD}❯${NC} ")" resp
         if [ -z "$resp" ]; then resp="$def"; fi
         case "${resp,,}" in
             y|yes) echo "y"; return ;;
@@ -260,11 +260,11 @@ interactive_profile_setup() {
     echo
 
     local in
-    read -r -p "$(echo -ne "${DIM}name${NC}              ${WHITE}[${name}]${NC} ${BOLD}>${NC} ")" in
+    read -r -p "$(echo -ne "${DIM}name${NC}              ${WHITE}[${name}]${NC} ${BOLD}❯${NC} ")" in
     name="${in:-$name}"
 
     while :; do
-        read -r -p "$(echo -ne "${DIM}hourly rate (EUR)${NC} ${WHITE}[${rate}]${NC} ${BOLD}>${NC} ")" in
+        read -r -p "$(echo -ne "${DIM}hourly rate (EUR)${NC} ${WHITE}[${rate}]${NC} ${BOLD}❯${NC} ")" in
         in="${in:-$rate}"
         in="${in//,/.}"
         if [[ "$in" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -296,16 +296,16 @@ interactive_profile_setup() {
     local want_smtp; want_smtp=$(prompt_yesno "configure SMTP for ICS email export?" "$default_smtp")
 
     if [ "$want_smtp" = "y" ]; then
-        read -r -p "$(echo -ne "${DIM}smtp server${NC}       ${WHITE}[${s_serv}]${NC} ${BOLD}>${NC} ")" in; s_serv="${in:-$s_serv}"
-        read -r -p "$(echo -ne "${DIM}smtp port${NC}         ${WHITE}[${s_port}]${NC} ${BOLD}>${NC} ")" in; s_port="${in:-$s_port}"
-        read -r -p "$(echo -ne "${DIM}smtp user${NC}         ${WHITE}[${s_user}]${NC} ${BOLD}>${NC} ")" in; s_user="${in:-$s_user}"
+        read -r -p "$(echo -ne "${DIM}smtp server${NC}       ${WHITE}[${s_serv}]${NC} ${BOLD}❯${NC} ")" in; s_serv="${in:-$s_serv}"
+        read -r -p "$(echo -ne "${DIM}smtp port${NC}         ${WHITE}[${s_port}]${NC} ${BOLD}❯${NC} ")" in; s_port="${in:-$s_port}"
+        read -r -p "$(echo -ne "${DIM}smtp user${NC}         ${WHITE}[${s_user}]${NC} ${BOLD}❯${NC} ")" in; s_user="${in:-$s_user}"
         local pass_hint="(blank = keep)"
         [ -z "$s_pass" ] && pass_hint="(input hidden)"
-        read -r -s -p "$(echo -ne "${DIM}smtp pass${NC}         ${WHITE}${pass_hint}${NC} ${BOLD}>${NC} ")" in; echo
+        read -r -s -p "$(echo -ne "${DIM}smtp pass${NC}         ${WHITE}${pass_hint}${NC} ${BOLD}❯${NC} ")" in; echo
         [ -n "$in" ] && s_pass="$in"
-        read -r -p "$(echo -ne "${DIM}smtp from${NC}         ${WHITE}[${s_from}]${NC} ${BOLD}>${NC} ")" in; s_from="${in:-$s_from}"
-        read -r -p "$(echo -ne "${DIM}smtp to${NC}           ${WHITE}[${s_to}]${NC} ${BOLD}>${NC} ")" in; s_to="${in:-$s_to}"
-        read -r -p "$(echo -ne "${DIM}smtp tls (yes/no)${NC} ${WHITE}[${s_tls}]${NC} ${BOLD}>${NC} ")" in; s_tls="${in:-$s_tls}"
+        read -r -p "$(echo -ne "${DIM}smtp from${NC}         ${WHITE}[${s_from}]${NC} ${BOLD}❯${NC} ")" in; s_from="${in:-$s_from}"
+        read -r -p "$(echo -ne "${DIM}smtp to${NC}           ${WHITE}[${s_to}]${NC} ${BOLD}❯${NC} ")" in; s_to="${in:-$s_to}"
+        read -r -p "$(echo -ne "${DIM}smtp tls (yes/no)${NC} ${WHITE}[${s_tls}]${NC} ${BOLD}❯${NC} ")" in; s_tls="${in:-$s_tls}"
     fi
 
     write_profile "$name" "$rate" "$breaks_en" "$log_br" \
@@ -566,9 +566,15 @@ parse_index_line() {
 pad_time() { printf "%02d" $((10#$1)); }
 
 read_time() {
-    local prompt="$1" default="$2" t
+    local prompt="$1" default="$2" override="${3-}" t
+    local prompt_str
+    if [ -n "$override" ]; then
+        prompt_str="$override"
+    else
+        prompt_str="${DIM}${prompt}${NC} ${WHITE}[${default}]${NC} ${BOLD}❯${NC} "
+    fi
     while true; do
-        read -r -p "$(echo -ne "${DIM}${prompt}${NC} ${WHITE}[${default}]${NC} > ")" t
+        read -r -p "$(echo -ne "$prompt_str")" t
         t=${t:-$default}
         if [[ "$t" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
             local h="${t%%:*}" m="${t##*:}"
@@ -775,7 +781,7 @@ prompt_type_selection() {
     done
     echo -e "${DIM}type${NC}${menu}"
     local choice
-    read -r -p "$(echo -ne "${DIM}type${NC} > ")" choice
+    read -r -p "$(echo -ne "${DIM}type${NC} ${BOLD}❯${NC} ")" choice
     if [ -z "$choice" ]; then
         P_SELECTED_TYPE="$default"; return
     fi
@@ -812,7 +818,7 @@ prompt_ambiguous_type() {
         i=$((i+1))
     done
     local choice
-    read -r -p "$(echo -ne "${DIM}choose${NC} ${WHITE}[1]${NC} > ")" choice
+    read -r -p "$(echo -ne "${DIM}choose${NC} ${WHITE}[1]${NC} ${BOLD}❯${NC} ")" choice
     [ -z "$choice" ] && choice=1
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#opts[@]}" ]; then
         P_SELECTED_TYPE="${opts[$((choice-1))]}"; return
@@ -1369,23 +1375,25 @@ edit_task_full() {
 
     # Order: title -> start -> end -> type -> desc -> bill (last).
     local new_title
-    read -r -p "$(echo -ne "${DIM}title${NC} ${WHITE}[${I_TITLE}]${NC} > ")" new_title
+    read -r -p "$(fmt_edit_label "$old_type" "$I_TITLE")" new_title
     new_title=${new_title:-$I_TITLE}
     new_title=$(trim_ws "$(sanitize_pipe "$new_title")")
 
-    local new_start; new_start=$(read_time "start" "$old_start")
-    local new_end;   new_end=$(read_time "end"   "$old_end")
+    local new_start; new_start=$(read_time "start" "$old_start" \
+        "$(fmt_edit_label "$old_type" "$old_start")")
+    local new_end;   new_end=$(read_time "end"   "$old_end" \
+        "$(fmt_edit_label "$old_type" "$old_end")")
 
     prompt_type_selection "$old_type"
     local new_type="$P_SELECTED_TYPE"
 
     local new_description
-    read -r -p "$(echo -ne "${DIM}desc${NC} ${WHITE}[${I_DESC}]${NC} > ")" new_description
+    read -r -p "$(fmt_edit_label "$new_type" "$I_DESC")" new_description
     new_description=${new_description:-$I_DESC}
     new_description=$(trim_ws "$(sanitize_pipe "$new_description")")
 
     local raw_h new_hours
-    read -r -p "$(echo -ne "${DIM}bill${NC} ${WHITE}[${old_hours}]${NC} > ")" raw_h
+    read -r -p "$(fmt_edit_label "$new_type" "$old_hours")" raw_h
     if [ -z "$raw_h" ]; then
         new_hours=$(validate_hours "$old_hours")
     else
@@ -1429,14 +1437,16 @@ edit_task_field() {
     case "$field" in
         title)
             local in
-            read -r -p "$(echo -ne "${DIM}title${NC} ${WHITE}[${cur_title}]${NC} > ")" in
+            read -r -p "$(fmt_edit_label "$cur_type" "$cur_title")" in
             [ -n "$in" ] && cur_title=$(trim_ws "$(sanitize_pipe "$in")")
             ;;
         start)
-            cur_start=$(read_time "start" "$cur_start")
+            cur_start=$(read_time "start" "$cur_start" \
+                "$(fmt_edit_label "$cur_type" "$cur_start")")
             ;;
         end)
-            cur_end=$(read_time "end" "$cur_end")
+            cur_end=$(read_time "end" "$cur_end" \
+                "$(fmt_edit_label "$cur_type" "$cur_end")")
             ;;
         type)
             prompt_type_selection "$cur_type"
@@ -1444,12 +1454,12 @@ edit_task_field() {
             ;;
         desc)
             local in
-            read -r -p "$(echo -ne "${DIM}desc${NC} ${WHITE}[${cur_desc}]${NC} > ")" in
+            read -r -p "$(fmt_edit_label "$cur_type" "$cur_desc")" in
             [ -n "$in" ] && cur_desc=$(trim_ws "$(sanitize_pipe "$in")")
             ;;
         bill)
             local raw_h
-            read -r -p "$(echo -ne "${DIM}bill${NC} ${WHITE}[${cur_hours}]${NC} > ")" raw_h
+            read -r -p "$(fmt_edit_label "$cur_type" "$cur_hours")" raw_h
             if [ -n "$raw_h" ]; then
                 local v
                 if v=$(validate_hours "$raw_h"); then
@@ -1902,7 +1912,7 @@ handle_break_flow() {
     if [ "$extended_prev" = true ]; then
         echo
         local resp
-        read -r -p "$(echo -ne "  ${BLUE}● back${NC}     ${DIM}resume previous task?${NC} ${WHITE}[Y/n]${NC} ${BOLD}>${NC} ")" resp
+        read -r -p "$(echo -ne "  ${BLUE}● back${NC}     ${DIM}resume previous task?${NC} ${WHITE}[Y/n]${NC} ${BOLD}❯${NC} ")" resp
         if [[ -z "$resp" || "${resp,,}" =~ ^(y|yes)$ ]]; then
             local prev_title prev_type
             prev_title=$(echo "$last_line" | awk -F'|' '{print $3}')
@@ -1998,9 +2008,8 @@ log_new_task() {
         if [ "$type" = "break" ]; then
             title="break"
         else
-            local tc; tc=$(type_color "$type")
             local raw_title
-            read -r -p "$(echo -ne "${tc}[${type}]${NC} ${DIM}title${NC} > ")" raw_title
+            read -r -p "$(fmt_edit_label "$type")" raw_title
             title=$(trim_ws "$(sanitize_pipe "$raw_title")")
             if [ -z "$title" ]; then
                 echo -e "${YELLOW}cancelled — empty title${NC}"
@@ -2040,9 +2049,9 @@ log_new_task() {
         break_state_on_task_end "$_end_ts"
     else
         echo -e "${YELLOW}● backfill${NC} ${DIM}${target_date}${NC}"
-        start=$(read_time "start" "09:00")
+        start=$(read_time "start" "09:00" "$(fmt_edit_label "$type" "09:00")")
         local default_end; default_end=$(adjust_time "$start" 60)
-        end=$(read_time "end" "$default_end")
+        end=$(read_time "end" "$default_end" "$(fmt_edit_label "$type" "$default_end")")
         echo "$title" > "$TEMP_FILE"
         if ! prompt_description_for_task; then
             rm -f "$TEMP_FILE"
@@ -3139,6 +3148,17 @@ fmt_desc_prompt() {
     local mid="${DIM}├─${NC} ${tc}[${type}]${NC}"
     [ -n "$title" ] && mid+=" ${WHITE}${title}${NC}"
     printf "%s\n%s\n%s└%s " "$top" "$mid" "$DIM" "$NC"
+}
+
+# Inline single-line label for inner edit prompts:
+#   [type] current_value ❯
+fmt_edit_label() {
+    local type="${1:-task}" current="${2-}"
+    local tc; tc=$(type_color "$type")
+    local out; out=$(printf "%s[%s]%s" "$tc" "$type" "$NC")
+    [ -n "$current" ] && out+=$(printf " %s%s%s" "$WHITE" "$current" "$NC")
+    out+=$(printf " %s❯%s " "$BOLD" "$NC")
+    printf "%s" "$out"
 }
 
 # Detailed break/cycle snapshot for the `status` command.
