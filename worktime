@@ -49,9 +49,15 @@ INDEX_FILE="$(mktemp -t task_timer_index.XXXXXX)"
 TEMP_FILE="$(mktemp -t task_timer_current.XXXXXX)"
 TS_FILE="$(mktemp -t task_timer_ts.XXXXXX)"
 ALERT_FILE="${TS_FILE}.alert"
+# Persistent (across sessions): break-cycle state file. Holds
+# BLOCK_START_TS, BREAK_NEXT_AT_TS, LAST_END_TS, BREAK_NEXT_DURATION_SEC
+# and the BREAK_SKIPPED list so the next session resumes where the
+# previous one left off.
+BREAK_STATE_FILE="$LOG_DIR/break_state"
 BREAK_DUE_FILE="${TS_FILE}.due"
 LAST_END_FILE="${TS_FILE}.lastend"
 WATCHER_PID=""
+MAIN_SHELL_PID="$$"
 
 # Break-cycle state (main shell only; watcher reads BREAK_DUE_FILE).
 BLOCK_START_TS=0
@@ -62,7 +68,9 @@ BREAK_SKIPPED=()
 
 cleanup() {
     [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null
-    rm -f "$INDEX_FILE" "$TEMP_FILE" "$TS_FILE" "$ALERT_FILE" "$BREAK_DUE_FILE" "$LAST_END_FILE"
+    rm -f "$INDEX_FILE" "$TEMP_FILE" "$TS_FILE" "$ALERT_FILE"
+    # BREAK_STATE_FILE / BREAK_DUE_FILE / LAST_END_FILE persist
+    # across sessions; we leave them alone on exit.
 }
 trap cleanup EXIT
 
@@ -391,11 +399,21 @@ start_break_watcher() {
             fi
             date +%s > "$ALERT_FILE"
             rm -f "$BREAK_DUE_FILE"
+            # Signal the main shell so any active read returns
+            # immediately - this is what lets the alert fire while
+            # the user is sitting at a description / edit prompt
+            # rather than waiting for them to press enter.
+            kill -USR1 "$MAIN_SHELL_PID" 2>/dev/null || true
         done
     ) &
     WATCHER_PID=$!
     disown "$WATCHER_PID" 2>/dev/null || true
 }
+
+# SIGUSR1 from the watcher sets this; main/desc reads check it
+# after returning from a (possibly interrupted) read.
+ALERT_PENDING=0
+trap 'ALERT_PENDING=1' SIGUSR1
 
 # ============================================================
 #  Scope and active date
@@ -1034,7 +1052,8 @@ show_stats() {
 
     local sort_file; sort_file=$(mktemp)
     local total=0 count=0 mn=999999 mx=0 m
-    declare -A type_count type_minutes
+    declare -A type_count type_minutes title_seen=()
+    local unique_count=0
     local free_count=0 free_minutes=0
     local sla_count=0 sla_minutes=0
     local billed_count=0 billed_worked_minutes=0
@@ -1046,6 +1065,11 @@ show_stats() {
         printf "%06d|%s|%s|%s|%s|%s|%s|%s\n" "$m" "$date" "$time_range" "$task" "$duration" "$description" "$type" "$hours" >> "$sort_file"
         total=$((total + m))
         count=$((count + 1))
+        local _title_key="${type:-task}|${task,,}"
+        if [ -z "${title_seen[$_title_key]:-}" ]; then
+            title_seen[$_title_key]=1
+            unique_count=$((unique_count + 1))
+        fi
         [ $m -lt $mn ] && mn=$m
         [ $m -gt $mx ] && mx=$m
 
@@ -1087,6 +1111,9 @@ show_stats() {
         total_str="$count tasks, $(format_minutes $total)"
     fi
     print_kv_row "tasks" "$total_str"
+    if [ "$unique_count" -ne "$count" ]; then
+        print_kv_row "unique" "$unique_count by (type, title)"
+    fi
 
     if [ $count -gt 0 ]; then
         local range_str="$(format_minutes $mn)–$(format_minutes $mx)"
@@ -1627,13 +1654,86 @@ extend_last_today_end() {
 # ============================================================
 # ---- Bildschirmpause cycle state ----
 
+# Persist the entire break-cycle state to disk so it survives across
+# worktime sessions. Stored as a simple key=value file the next
+# startup can source.
+save_break_state() {
+    {
+        echo "BLOCK_START_TS=$BLOCK_START_TS"
+        echo "LAST_END_TS=$LAST_END_TS"
+        echo "BREAK_NEXT_AT_TS=$BREAK_NEXT_AT_TS"
+        echo "BREAK_NEXT_DURATION_SEC=$BREAK_NEXT_DURATION_SEC"
+        local IFS='|'
+        echo "BREAK_SKIPPED_JOINED=${BREAK_SKIPPED[*]}"
+    } > "$BREAK_STATE_FILE.tmp" 2>/dev/null \
+        && mv -f "$BREAK_STATE_FILE.tmp" "$BREAK_STATE_FILE" 2>/dev/null
+    # Keep BREAK_DUE_FILE / LAST_END_FILE in sync for the watcher.
+    if [ "$BREAK_NEXT_AT_TS" -gt 0 ]; then
+        echo "$BREAK_NEXT_AT_TS" > "$BREAK_DUE_FILE"
+    else
+        rm -f "$BREAK_DUE_FILE"
+    fi
+    if [ "$LAST_END_TS" -gt 0 ]; then
+        echo "$LAST_END_TS" > "$LAST_END_FILE"
+    else
+        rm -f "$LAST_END_FILE"
+    fi
+}
+
+# Load break state from disk on startup, applying gap-reset if the
+# last task ended long enough ago that the cycle is stale.
+load_break_state() {
+    [ -f "$BREAK_STATE_FILE" ] || return 0
+    local BREAK_SKIPPED_JOINED=""
+    # shellcheck disable=SC1090
+    source "$BREAK_STATE_FILE" 2>/dev/null || return 0
+    BLOCK_START_TS=${BLOCK_START_TS:-0}
+    LAST_END_TS=${LAST_END_TS:-0}
+    BREAK_NEXT_AT_TS=${BREAK_NEXT_AT_TS:-0}
+    BREAK_NEXT_DURATION_SEC=${BREAK_NEXT_DURATION_SEC:-$BREAK_INITIAL_LENGTH}
+    BREAK_SKIPPED=()
+    if [ -n "$BREAK_SKIPPED_JOINED" ]; then
+        local IFS='|'
+        read -r -a BREAK_SKIPPED <<< "$BREAK_SKIPPED_JOINED"
+    fi
+    # Apply gap-reset: if the last task ended more than BREAK_GAP_RESET
+    # ago, the previous block is stale - reset to a fresh cycle.
+    if [ "$LAST_END_TS" -gt 0 ] && [ "$BLOCK_START_TS" -gt 0 ]; then
+        local now; now=$(date +%s)
+        if [ $((now - LAST_END_TS)) -ge "$BREAK_GAP_RESET" ]; then
+            BLOCK_START_TS=0
+            LAST_END_TS=0
+            BREAK_NEXT_AT_TS=0
+            BREAK_NEXT_DURATION_SEC=$BREAK_INITIAL_LENGTH
+            BREAK_SKIPPED=()
+            save_break_state
+        fi
+    fi
+    # Sync the watcher's view files.
+    if [ "$BREAK_NEXT_AT_TS" -gt 0 ]; then
+        echo "$BREAK_NEXT_AT_TS" > "$BREAK_DUE_FILE"
+    fi
+    if [ "$LAST_END_TS" -gt 0 ]; then
+        echo "$LAST_END_TS" > "$LAST_END_FILE"
+    fi
+}
+
 break_state_reset() {
     BLOCK_START_TS=0
     LAST_END_TS=0
     BREAK_NEXT_AT_TS=0
     BREAK_NEXT_DURATION_SEC=$BREAK_INITIAL_LENGTH
     BREAK_SKIPPED=()
-    rm -f "$BREAK_DUE_FILE" "$LAST_END_FILE"
+    save_break_state
+}
+
+# User-facing 'reset' command. Resets the break cycle so the
+# next-break window starts fresh at $BREAK_INITIAL_LENGTH.
+break_state_reset_cmd() {
+    break_state_reset
+    local m=$((BREAK_INITIAL_LENGTH / 60))
+    local work_m=$((BREAK_WORK_BLOCK / 60))
+    echo -e "${GREEN}─ break reset${NC} ${DIM}next nudge after ${work_m}m of work (${m} min break)${NC}"
 }
 
 # Called at task start (when user types title).
@@ -1648,15 +1748,15 @@ break_state_on_task_start() {
         BREAK_NEXT_AT_TS=$((BLOCK_START_TS + BREAK_WORK_BLOCK))
         BREAK_NEXT_DURATION_SEC=$BREAK_INITIAL_LENGTH
         BREAK_SKIPPED=()
-        echo "$BREAK_NEXT_AT_TS" > "$BREAK_DUE_FILE"
     fi
+    save_break_state
 }
 
 break_state_on_task_end() {
     [[ "${BREAKS_ENABLED,,}" =~ ^(yes|true|y|1|on)$ ]] || return 0
     local ts="$1"
     LAST_END_TS="$ts"
-    echo "$ts" > "$LAST_END_FILE"
+    save_break_state
 }
 
 # Called once per main-prompt iteration; resets the cycle if the
@@ -1743,13 +1843,23 @@ handle_break_alert() {
         echo -e "    ${DIM}skipped ${s}${NC}"
     done
 
+    # Inline read with a 3-minute timeout. No response = treat as
+    # 'skipped' (which doubles the next break and emails the
+    # violation). This is what makes the alert effective when the
+    # user is too busy to react.
     local resp
-    resp=$(prompt_yesno "take a ${req_min} min break?" "y")
-    if [ "$resp" = "y" ]; then
-        do_break_accepted "$req_sec"
-    else
+    local _hint; _hint=$(printf "%s%s%s" "$WHITE" "[Y/n]" "$NC")
+    echo -e "  ${BLUE}●${NC} ${DIM}take a ${req_min} min break?${NC} ${_hint} ${DIM}(auto-skip in 3 min)${NC}"
+    if ! read -r -t 180 -p "$(printf "%s└──%s " "$DIM" "$NC")" resp; then
+        echo
+        echo -e "  ${YELLOW}● no response within 3 min — auto-skipping${NC}"
         do_break_refused "$req_sec"
+        return
     fi
+    case "${resp,,}" in
+        n|no) do_break_refused "$req_sec" ;;
+        *)    do_break_accepted "$req_sec" ;;
+    esac
 }
 
 do_break_accepted() {
@@ -1794,7 +1904,7 @@ do_break_refused() {
 
     BREAK_NEXT_DURATION_SEC=$((BREAK_NEXT_DURATION_SEC + BREAK_INCREMENT))
     BREAK_NEXT_AT_TS=$((at_ts + req_sec + BREAK_WORK_BLOCK))
-    echo "$BREAK_NEXT_AT_TS" > "$BREAK_DUE_FILE"
+    save_break_state
     local next_min=$((BREAK_NEXT_DURATION_SEC / 60))
     local next_at_str; next_at_str=$(date -d "@$BREAK_NEXT_AT_TS" +%H:%M)
     echo
@@ -1940,13 +2050,25 @@ handle_break_flow() {
 #   4. recognized command       -> dispatch, loop (back to desc)
 #   5. anything else            -> set $description, return 0
 prompt_description_for_task() {
+    IN_DESC_CONTEXT=1
     while :; do
         local raw
         read -r -p "$(fmt_desc_prompt "$type" "$title")" raw
+        # If the watcher sent SIGUSR1 mid-read, surface the alert
+        # immediately - the in-progress task is cancelled (the user
+        # can resume after the break).
+        if [ "$ALERT_PENDING" = "1" ]; then
+            ALERT_PENDING=0
+            echo
+            handle_break_alert
+            IN_DESC_CONTEXT=0
+            return 1
+        fi
         local trimmed; trimmed=$(trim_ws "$raw")
 
         if [ -z "$trimmed" ]; then
             description=""
+            IN_DESC_CONTEXT=0
             return 0
         fi
 
@@ -1956,6 +2078,7 @@ prompt_description_for_task() {
         case "${d_cmd,,}" in
             q|quit|exit|abort|cancel)
                 echo -e "${YELLOW}● cancelled${NC}"
+                IN_DESC_CONTEXT=0
                 return 1
                 ;;
         esac
@@ -1977,6 +2100,7 @@ prompt_description_for_task() {
 
         # Otherwise treat as the description.
         description="$trimmed"
+        IN_DESC_CONTEXT=0
         return 0
     done
 }
@@ -2415,7 +2539,24 @@ dispatch_command() {
         type)              edit_field_cmd type  "$args"; echo ;;
         start)             edit_field_cmd start "$args"; echo ;;
         end)               edit_field_cmd end   "$args"; echo ;;
-        bill|billed|hours) edit_field_cmd bill  "$args"; echo ;;
+        bill|billed|hours)
+            if [ "${IN_DESC_CONTEXT:-0}" = "1" ]; then
+                # We're mid-task - mutate the in-progress hours, not
+                # the last logged row.
+                local _raw _v
+                read -r -p "$(fmt_field_line "bill" "${hours:-0.00}" 1)" _raw
+                if [ -n "$_raw" ]; then
+                    if _v=$(validate_hours "$_raw"); then
+                        hours="$_v"
+                        echo -e "  ${GREEN}─ bill${NC} ${DIM}set on in-progress task to${NC} ${WHITE}${_v}${NC}"
+                    else
+                        echo -e "  ${YELLOW}invalid hours, keeping ${hours:-0.00}${NC}"
+                    fi
+                fi
+            else
+                edit_field_cmd bill "$args"
+            fi
+            echo ;;
         resume)            resume_task "$args"; echo ;;
         grep|search)       search_tasks "$args"; echo ;;
         export)            export_scope_to_ics; echo ;;
@@ -2463,6 +2604,7 @@ dispatch_command() {
             echo ;;
         scope)             handle_scope_cmd "$args"; echo ;;
         status)            show_break_status; echo ;;
+        reset|break-reset) break_state_reset_cmd; echo ;;
         migrate)           migrate_legacy; echo ;;
         clear)
             clear
@@ -3335,6 +3477,7 @@ else
 fi
 
 touch_timestamp
+load_break_state
 start_break_watcher
 show_calendar "" minimal
 show_welcome
@@ -3348,6 +3491,13 @@ while true; do
     fi
 
     if ! IFS= read -r -p "$(fmt_simple_prompt)" input; then
+        # Interrupted (eg. SIGUSR1 from the watcher) or EOF.
+        if [ "$ALERT_PENDING" = "1" ]; then
+            ALERT_PENDING=0
+            echo
+            handle_break_alert
+            continue
+        fi
         echo
         break
     fi
