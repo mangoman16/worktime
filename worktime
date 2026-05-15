@@ -264,7 +264,7 @@ scope_set_date() {
         echo -e "${RED}date must be YYYY-MM-DD${NC}"; return 1
     fi
     if ! date -d "$d" +%s >/dev/null 2>&1; then
-        echo -e "${RED}invalid calendar date: $d${NC}"; return 1
+        echo -e "${RED}─ invalid date${NC} ${DIM}$d${NC}"; return 1
     fi
     ACTIVE_DATE="$d"
     SCOPE_FILES=("$(get_log_path "$d")")
@@ -292,7 +292,7 @@ shift_active_date() {
 scope_set_range() {
     local start="$1" end="$2"
     if ! date -d "$start" +%s >/dev/null 2>&1 || ! date -d "$end" +%s >/dev/null 2>&1; then
-        echo -e "${RED}invalid date range${NC}"; return 1
+        echo -e "${RED}─ invalid date range${NC}"; return 1
     fi
     if [[ "$end" < "$start" ]]; then
         echo -e "${RED}end date must be on or after start date${NC}"; return 1
@@ -312,7 +312,7 @@ scope_set_range() {
 scope_set_month() {
     local arg="${1:-$(date +%Y-%m)}"
     if ! [[ "$arg" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
-        echo -e "${RED}month format: YYYY-MM${NC}"; return 1
+        echo -e "${RED}─ month format${NC} ${DIM}YYYY-MM${NC}"; return 1
     fi
     local y="${arg%-*}" m="${arg#*-}"
     local dir="$LOG_DIR/$y/$m"
@@ -329,7 +329,7 @@ scope_set_month() {
 scope_set_year() {
     local y="${1:-$(date +%Y)}"
     if ! [[ "$y" =~ ^[0-9]{4}$ ]]; then
-        echo -e "${RED}year format: YYYY${NC}"; return 1
+        echo -e "${RED}─ year format${NC} ${DIM}YYYY${NC}"; return 1
     fi
     local dir="$LOG_DIR/$y"
     SCOPE_FILES=()
@@ -346,7 +346,7 @@ scope_set_year() {
 scope_set_directory() {
     local dir="$1"
     if [ ! -d "$dir" ]; then
-        echo -e "${RED}directory not found: $dir${NC}"; return 1
+        echo -e "${RED}─ directory not found${NC} ${DIM}$dir${NC}"; return 1
     fi
     SCOPE_FILES=()
     ACTIVE_DATE=""
@@ -361,7 +361,7 @@ scope_set_directory() {
 scope_set_logfile() {
     local f="$1"
     if [ ! -f "$f" ]; then
-        echo -e "${RED}log file not found: $f${NC}"; return 1
+        echo -e "${RED}─ log file not found${NC} ${DIM}$f${NC}"; return 1
     fi
     SCOPE_FILES=("$f")
     ACTIVE_DATE=""
@@ -429,7 +429,7 @@ read_time() {
             printf "%s:%s" "$(pad_time "$h")" "$(pad_time "$m")"
             return
         fi
-        echo -e "${RED}invalid time, use HH:MM (00:00-23:59)${NC}"
+        echo -e "${RED}─ invalid time${NC} ${DIM}(HH:MM, 00:00-23:59)${NC}"
     done
 }
 
@@ -813,7 +813,7 @@ print_totals_row() {
 list_scope() {
     build_index
     if [ "$(index_count)" -eq 0 ]; then
-        echo -e "${YELLOW}no tasks in scope:${NC} $SCOPE_LABEL"
+        echo -e "${DIM}─ no tasks in scope${NC}"
         return
     fi
     print_listing_header
@@ -845,7 +845,7 @@ show_last() {
     local count="${1:-5}"
     [[ "$count" =~ ^[0-9]+$ ]] || count=5
     if [ "$(index_count)" -eq 0 ]; then
-        echo -e "${YELLOW}no tasks in scope:${NC} $SCOPE_LABEL"
+        echo -e "${DIM}─ no tasks in scope${NC}"
         return
     fi
     print_listing_header
@@ -876,7 +876,7 @@ print_kv_row_color() {
 show_stats() {
     build_index
     if [ "$(index_count)" -eq 0 ]; then
-        echo -e "${YELLOW}no tasks in scope:${NC} $SCOPE_LABEL"
+        echo -e "${DIM}─ no tasks in scope${NC}"
         return
     fi
 
@@ -1026,7 +1026,7 @@ search_tasks() {
     fi
     build_index
     if [ "$(index_count)" -eq 0 ]; then
-        echo -e "${YELLOW}no tasks in scope.${NC}"; return
+        echo -e "${DIM}─ no tasks in scope${NC}"; return
     fi
 
     # Tokenize on whitespace; each token is one filter, ANDed.
@@ -1049,7 +1049,7 @@ search_tasks() {
                     case $rc in
                         0) v="$mp" ;;
                         2) echo -e "${YELLOW}ambiguous type prefix '${v}' (${mp#AMBIG:})${NC}"; return ;;
-                        *) echo -e "${RED}unknown type '${v}'${NC}"; return ;;
+                        *) echo -e "${RED}─ unknown type ${DIM}'${v}'${NC}"; return ;;
                     esac
                 fi
                 ;;
@@ -1102,7 +1102,7 @@ search_tasks() {
 
     echo -e "${DIM}filter:${NC} $label"
     if [ -z "$matches" ]; then
-        echo -e "${YELLOW}no tasks matching in scope:${NC} $SCOPE_LABEL"
+        echo -e "${DIM}─ no matches in scope${NC}"
         return
     fi
 
@@ -1163,15 +1163,15 @@ delete_task() {
     local id="$1"
     [ -s "$INDEX_FILE" ] || build_index
     if [ "$(index_count)" -eq 0 ]; then
-        echo -e "${YELLOW}no tasks to delete in scope.${NC}"; return
+        echo -e "${DIM}─ no tasks in scope${NC}"; return
     fi
     [ -z "$id" ] && id=$(tail -1 "$INDEX_FILE" | cut -d'|' -f1)
     if ! [[ "$id" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}invalid task id. use: rm <number>${NC}"; return
+        echo -e "${RED}─ invalid task id${NC} ${DIM}(use: rm <id>)${NC}"; return
     fi
     local entry; entry=$(index_lookup "$id")
     if [ -z "$entry" ]; then
-        echo -e "${RED}task id $id not found in current scope.${NC}"; return
+        echo -e "${RED}─ task #$id not found in scope${NC}"; return
     fi
     parse_index_line "$entry"
     local deleted_file="$I_FILE" deleted_line="$I_LINE"
@@ -1213,15 +1213,15 @@ edit_task_full() {
     local id="$1"
     [ -s "$INDEX_FILE" ] || build_index
     if [ "$(index_count)" -eq 0 ]; then
-        echo -e "${YELLOW}no tasks to edit in scope.${NC}"; return 1
+        echo -e "${DIM}─ no tasks in scope${NC}"; return 1
     fi
     [ -z "$id" ] && id=$(tail -1 "$INDEX_FILE" | cut -d'|' -f1)
     if ! [[ "$id" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}invalid task id. use: edit <number>${NC}"; return 1
+        echo -e "${RED}─ invalid task id${NC} ${DIM}(use: edit <id>)${NC}"; return 1
     fi
     local entry; entry=$(index_lookup "$id")
     if [ -z "$entry" ]; then
-        echo -e "${RED}task id $id not found in current scope.${NC}"; return 1
+        echo -e "${RED}─ task #$id not found in scope${NC}"; return 1
     fi
     parse_index_line "$entry"
     local old_start="${I_RANGE%%-*}" old_end="${I_RANGE##*-}"
@@ -1375,7 +1375,7 @@ handle_edit_cmd() {
                 edit_task_full "$LAST_TASK_ID"
             fi
         else
-            echo -e "${YELLOW}nothing recent to edit — try 'edit <id>' or 'edit help'${NC}"
+            echo -e "${DIM}─ nothing recent to edit${NC} ${DIM}— try 'edit <id>' or 'edit help'${NC}"
         fi
         return
     fi
@@ -1413,13 +1413,13 @@ edit_field_cmd() {
     local field="$1" id="$2"
     [ -s "$INDEX_FILE" ] || build_index
     if [ "$(index_count)" -eq 0 ]; then
-        echo -e "${YELLOW}no tasks in scope.${NC}"; return 1
+        echo -e "${DIM}─ no tasks in scope${NC}"; return 1
     fi
     if [ -z "$id" ]; then
         id="${LAST_TASK_ID:-$(tail -1 "$INDEX_FILE" | cut -d'|' -f1)}"
     fi
     if ! [[ "$id" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}invalid task id. use: $field [id]${NC}"; return 1
+        echo -e "${RED}─ invalid task id${NC} ${DIM}(use: $field [id])${NC}"; return 1
     fi
     if ! edit_task_field "$id" "$field"; then
         edit_task_full "$id"
@@ -1431,7 +1431,7 @@ resume_task() {
     local id="$1"
     [ -s "$INDEX_FILE" ] || build_index
     if [ "$(index_count)" -eq 0 ]; then
-        echo -e "${YELLOW}nothing to resume in scope.${NC}"; return
+        echo -e "${DIM}─ no tasks to resume${NC}"; return
     fi
     [ -z "$id" ] && id=$(tail -1 "$INDEX_FILE" | cut -d'|' -f1)
     if ! [[ "$id" =~ ^[0-9]+$ ]]; then
@@ -1439,7 +1439,7 @@ resume_task() {
     fi
     local entry; entry=$(index_lookup "$id")
     if [ -z "$entry" ]; then
-        echo -e "${RED}task id $id not found.${NC}"; return
+        echo -e "${RED}─ task #$id not found${NC}"; return
     fi
     parse_index_line "$entry"
     local resumed_input="$I_TITLE"
@@ -1642,7 +1642,7 @@ show_calendar() {
     local arg="${1:-$(date +%Y-%m)}"
     local mode="${2:-full}"
     if ! [[ "$arg" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
-        echo -e "${RED}format: cal YYYY-MM${NC}"; return
+        echo -e "${RED}─ format${NC} ${DIM}cal YYYY-MM${NC}"; return
     fi
     local y="${arg%-*}" m="${arg#*-}"
     local first_day="$y-$m-01"
@@ -1762,7 +1762,7 @@ ics_uid() {
 
 export_scope_to_ics() {
     if [ "${#SCOPE_FILES[@]}" -eq 0 ]; then
-        echo -e "${YELLOW}nothing to export in scope:${NC} $SCOPE_LABEL"
+        echo -e "${DIM}─ no tasks in scope${NC}"
         return 1
     fi
     local stem
@@ -1842,7 +1842,7 @@ export_scope_to_ics() {
 
     if [ $valid -eq 0 ]; then
         rm -f "$out"
-        echo -e "${YELLOW}no valid entries to export in scope:${NC} $SCOPE_LABEL"
+        echo -e "${DIM}─ no valid entries in scope${NC}"
         return 1
     fi
     local skipped=""
@@ -2135,7 +2135,7 @@ manage_profile() {
             echo -e "${GREEN}─ profile${NC}   reloaded"
             ;;
         *)
-            echo -e "${RED}usage: profile [show|edit|open]${NC}"
+            echo -e "${RED}─ usage${NC} ${DIM}profile [show|edit|open]${NC}"
             ;;
     esac
 }
@@ -2182,7 +2182,7 @@ help_hint() {
     echo -e "  ${BOLD}drill in${NC}"
     echo -e "    ${WHITE}help <category>${NC}   ${GREEN}logging${NC}${DIM},${NC} ${CYAN}view${NC}${DIM},${NC} ${YELLOW}editing${NC}${DIM},${NC} ${MAGENTA}scoping${NC}${DIM},${NC} ${BLUE}tools${NC}"
     echo -e "    ${WHITE}help <command>${NC}    ${DIM}any command listed above   (e.g.${NC} ${WHITE}help edit${NC}${DIM})${NC}"
-    echo -e "    ${WHITE}help <topic>${NC}      ${WHITE}types${NC}${DIM},${NC} ${WHITE}billing${NC}${DIM},${NC} ${WHITE}breaks${NC}${DIM},${NC} ${WHITE}flags${NC}"
+    echo -e "    ${WHITE}help <topic>${NC}      ${WHITE}types${NC}${DIM},${NC} ${WHITE}billing${NC}${DIM},${NC} ${WHITE}flags${NC}"
     echo -e "    ${WHITE}help full${NC}         ${DIM}everything on one screen${NC}"
 }
 
@@ -2209,7 +2209,7 @@ show_help() {
     print_help_row "VIEW"    "$CYAN"    "all" "ls" "stats" "grep"
     print_help_row "EDIT"    "$YELLOW"  "edit" "title" "desc" "type" "start" "end" "bill" "rm"
     print_help_row "SCOPE"   "$MAGENTA" "today" "yesterday" "tomorrow" "goto" "month" "year" "range" "cal" "scope"
-    print_help_row "TOOLS"   "$BLUE"    "status" "export" "profile" "migrate" "clear" "help" "quit"
+    print_help_row "TOOLS"   "$BLUE"    "export" "profile" "migrate" "clear" "help" "quit"
     echo
     help_hint
     echo
@@ -2316,10 +2316,6 @@ show_help_command() {
             ;;
 
         # ---- TOOLS ----
-        status)
-            echo -e "  ${BOLD}status${NC}                       Bildschirmpause snapshot"
-            echo -e "    ${DIM}block start, time worked, time until next break, skip history${NC}"
-            ;;
         export)
             echo -e "  ${BOLD}export${NC}                       write ICS file for the active scope"
             ;;
@@ -2339,7 +2335,7 @@ show_help_command() {
             echo -e "  ${BOLD}help${NC}                         compact command summary"
             echo -e "    ${WHITE}help <category>${NC}            logging  view  editing  scoping  tools"
             echo -e "    ${WHITE}help <command>${NC}             details for one command"
-            echo -e "    ${WHITE}help <topic>${NC}               topic ref: types, billing, breaks, flags"
+            echo -e "    ${WHITE}help <topic>${NC}               topic ref: types, billing, flags"
             echo -e "    ${WHITE}help full${NC}                  show everything on one screen"
             ;;
         quit|exit|q)
@@ -2419,7 +2415,7 @@ show_help_category() {
             cmds=("today" "yesterday" "tomorrow" "goto" "month" "year" "range" "cal" "scope") ;;
         tools|tooling)
             label="TOOLS"; color="$BLUE"
-            cmds=("status" "export" "profile" "migrate" "clear" "help" "quit") ;;
+            cmds=("export" "profile" "migrate" "clear" "help" "quit") ;;
         *) return 1 ;;
     esac
     echo -e "  ${BOLD}${color}${label}${NC}"
@@ -2508,7 +2504,6 @@ show_full_help() {
     echo -e "    ${WHITE}scope${NC}                    print current scope info"
     echo
     echo -e "  ${BOLD}TOOLS${NC}"
-    echo -e "    ${WHITE}status${NC}                   Bildschirmpause snapshot (block + skips)"
     echo -e "    ${WHITE}export${NC}                   write ICS for the active scope"
     echo -e "    ${WHITE}profile${NC}                  show profile values"
     echo -e "    ${WHITE}profile edit${NC}             walk through profile fields"
@@ -2783,7 +2778,6 @@ while true; do
         * )
             if ! dispatch_command "$cmd" "$args"; then
                 log_new_task "$input"
-                echo
             fi
             ;;
     esac
